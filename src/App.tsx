@@ -73,6 +73,19 @@ const RELEASE_NOTE = {
 
 type UpdateStatus = "checking" | "available" | "rebuild" | "current" | "installing" | "error";
 
+// How long a session has to stay quiet before it counts as connected but idle rather than working.
+// Long enough that the gaps between an agent's own writes do not flicker the dot.
+const QUIET_MS = 1200;
+
+// Three states the sidebar dot tells apart: the terminal is gone, it is up and quiet, or it is up and
+// producing output. Each gets its own color, so the state survives a display where the pulse is
+// suppressed and the motion only reinforces what green already says.
+const SESSION_STATUS = {
+  disconnected: { dot: "bg-muted-foreground/40", label: "Disconnected" },
+  idle: { dot: "bg-emerald-500", label: "Connected, idle" },
+  working: { dot: "bg-blue-500 animate-pulse motion-reduce:animate-none", label: "Connected, working" },
+} as const;
+
 // A local build names its commit and is red, so it is never mistaken for the installed copy.
 // A release names its version and says at a glance whether it is the current one. The top bar and the
 // update dialog render this one badge, so the version, the release date and the link to it are stated
@@ -162,6 +175,7 @@ function SessionRow({
   session,
   active,
   starting,
+  working,
   onSelect,
   onRename,
   onRestart,
@@ -170,11 +184,13 @@ function SessionRow({
   session: Session;
   active: boolean;
   starting: boolean;
+  working: boolean;
   onSelect: () => void;
   onRename: (name: string) => void;
   onRestart: () => void;
   onClose: () => void;
 }) {
+  const status = SESSION_STATUS[!session.running ? "disconnected" : working ? "working" : "idle"];
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(session.name);
 
@@ -199,8 +215,8 @@ function SessionRow({
           ) : (
             <span
               role="img"
-              className={`absolute -right-0.5 -bottom-0.5 size-2 rounded-full ring-2 ${active ? "ring-sidebar-accent" : "ring-sidebar"} ${session.running ? "bg-emerald-500" : "bg-muted-foreground/40"}`}
-              aria-label={session.running ? "Running" : "Not running"}
+              className={`absolute -right-0.5 -bottom-0.5 size-2 rounded-full ring-2 ${active ? "ring-sidebar-accent" : "ring-sidebar"} ${status.dot}`}
+              aria-label={status.label}
             />
           )}
         </span>
@@ -325,6 +341,9 @@ function App() {
   const [closing, setClosing] = useState<Session>();
   const [error, setError] = useState("");
   const [startingIds, setStartingIds] = useState<Set<string>>(new Set());
+  // Sessions whose terminal has written something recently, which is what separates a connected
+  // session that is working from one that is merely connected.
+  const [working, setWorking] = useState<Set<string>>(new Set());
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [version, setVersion] = useState("");
   // Undefined until asked: an empty string is a release, anything else is the commit it was built from.
@@ -336,6 +355,7 @@ function App() {
   const [availableVersion, setAvailableVersion] = useState("");
   const [updateError, setUpdateError] = useState("");
   const runs = useRef(new Map<string, string>());
+  const workTimers = useRef(new Map<string, number>());
   const resumed = useRef("");
   const themeRef = useRef<Theme>("dark");
   const sessionsRef = useRef<Session[]>([]);
@@ -441,13 +461,36 @@ function App() {
     };
   }, [commit, askRelease]);
 
+  // Output arrives as a stream of chunks, so this touches React state only on the two edges of a
+  // burst: the first chunk marks the session working, and a quiet spell marks it idle again. Between
+  // those the timer is just reset, which keeps a busy session from re-rendering the sidebar per chunk.
+  const markWorking = useCallback((sessionId: string) => {
+    const timers = workTimers.current;
+    const pending = timers.get(sessionId);
+    if (pending) window.clearTimeout(pending);
+    else setWorking((current) => new Set(current).add(sessionId));
+    timers.set(
+      sessionId,
+      window.setTimeout(() => {
+        timers.delete(sessionId);
+        setWorking((current) => {
+          const next = new Set(current);
+          next.delete(sessionId);
+          return next;
+        });
+      }, QUIET_MS),
+    );
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     let unlistenOutput: (() => void) | undefined;
     let unlistenExit: (() => void) | undefined;
     void Promise.all([
       listen<{ sessionId: string; runId: string; data: number[] }>("pty-output", ({ payload }) => {
-        if (runs.current.get(payload.sessionId) === payload.runId) appendOutput(payload.sessionId, payload.data);
+        if (runs.current.get(payload.sessionId) !== payload.runId) return;
+        appendOutput(payload.sessionId, payload.data);
+        markWorking(payload.sessionId);
       }),
       listen<{ sessionId: string; runId: string }>("pty-exit", ({ payload }) => {
         if (runs.current.get(payload.sessionId) !== payload.runId) return;
@@ -465,12 +508,15 @@ function App() {
       unlistenOutput = output;
       unlistenExit = exit;
     });
+    const timers = workTimers.current;
     return () => {
       disposed = true;
       unlistenOutput?.();
       unlistenExit?.();
+      for (const timer of timers.values()) window.clearTimeout(timer);
+      timers.clear();
     };
-  }, []);
+  }, [markWorking]);
 
   const launch = useCallback(async (session: Session, resume: boolean) => {
     if (runs.current.has(session.id)) return;
@@ -740,6 +786,7 @@ function App() {
                       session={session}
                       active={session.id === selectedId}
                       starting={startingIds.has(session.id)}
+                      working={working.has(session.id)}
                       onSelect={() => openRef.current(session)}
                       onRename={(name) =>
                         setSessions((current) =>

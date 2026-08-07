@@ -2160,6 +2160,39 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
     app.restart()
 }
 
+// Tauri fills the About panel from the bundle config, which reaches it with only a name and version,
+// so the panel read as bare. macOS only: it is the one platform Tauri gives an application menu, and
+// setting one on Windows or Linux would put a native menu bar on a window that draws its own chrome.
+// Those platforms carry the same details in the installer metadata from tauri.conf.json instead.
+//
+// Only the fields NSAboutPanel actually renders are set. It ignores authors, comments, license and
+// website, so setting those here would look thorough and show nothing.
+#[cfg(target_os = "macos")]
+fn describe_app(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{AboutMetadata, Menu, MenuItemKind, PredefinedMenuItem};
+
+    let about = AboutMetadata {
+        name: Some("Lite".into()),
+        version: Some(app.package_info().version.to_string()),
+        copyright: Some("© 2026 Ultralytics Inc.".into()),
+        // Credits are a plain NSAttributedString in a short scroll view: no link attributes, so a URL
+        // is dead text, and more than a line or two becomes a wall behind a scrollbar. The panel
+        // already states the name, version and copyright, so this only says what Lite is. The
+        // clickable way to the repository is the logomark in the top bar.
+        credits: Some("A fast, local workspace for AI coding agents.".into()),
+        ..Default::default()
+    };
+
+    let menu = Menu::default(app)?;
+    // About is the first item of the application submenu, which is the first submenu on macOS.
+    if let Some(MenuItemKind::Submenu(app_menu)) = menu.items()?.first() {
+        app_menu.remove_at(0)?;
+        app_menu.insert(&PredefinedMenuItem::about(app, None, Some(about))?, 0)?;
+    }
+    app.set_menu(menu)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2170,6 +2203,13 @@ pub fn run() {
             app.manage(load_roots(app.handle()));
             app.manage(load_provider_sessions(app.handle()));
             app.manage(load_codex_server(app.handle())?);
+            // A relaunch inherits no activation from the process it replaces, so the build installed
+            // by an update came back behind every other window with nothing to show it had finished.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+            #[cfg(target_os = "macos")]
+            describe_app(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
