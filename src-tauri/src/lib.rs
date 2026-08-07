@@ -965,9 +965,16 @@ fn shell_path(shell: &str) -> Option<String> {
 
 // An account shell that does not speak this command leaves nothing usable, so the search falls back to
 // the POSIX shell rather than losing every provider CLI.
+// Asking costs a login shell, and the answer holds for as long as Lite is open, so it is asked once
+// and every command Lite resolves afterwards is free.
 #[cfg(unix)]
 fn user_path() -> Option<String> {
-    shell_path(&CommandBuilder::new_default_prog().get_shell()).or_else(|| shell_path("/bin/sh"))
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        shell_path(&CommandBuilder::new_default_prog().get_shell())
+            .or_else(|| shell_path("/bin/sh"))
+    })
+    .clone()
 }
 
 #[cfg(windows)]
@@ -2049,6 +2056,47 @@ async fn git_status(roots: State<'_, Roots>, root_id: String) -> Result<Option<G
     }))
 }
 
+// A remote is stored the way the repository was cloned, and only its https form opens in a browser.
+// Anything else is left alone rather than guessed at, so a link is offered only when it will work.
+fn browse_url(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/');
+    let remote = remote.strip_suffix(".git").unwrap_or(remote);
+    // The scp form names a user, and not everyone's is git.
+    if !remote.contains("://") {
+        let (authority, repository) = remote.split_once(':')?;
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        return Some(format!("https://{host}/{repository}"));
+    }
+    let ssh = remote.strip_prefix("ssh://");
+    let rest = ssh.or_else(|| remote.strip_prefix("https://"))?;
+    let (authority, repository) = rest.split_once('/')?;
+    // Whatever the clone was made with — a token, an account name — is Git's business and has none in a
+    // link, still less in a browser's address bar and history. An ssh port reaches nothing a browser
+    // can read, where an https one is the site itself.
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if ssh.is_some() && host.contains(':') {
+        return None;
+    }
+    Some(format!("https://{host}/{repository}"))
+}
+
+// The repository a folder was cloned from, asked for on its own: naming it costs one git call, where
+// the full status reads the whole worktree.
+#[tauri::command]
+async fn git_remote(roots: State<'_, Roots>, root_id: String) -> Result<Option<String>, String> {
+    let path = root_path(&roots, &root_id)?;
+    let git = resolve_executable("git").unwrap_or_else(|| "git".into());
+    Ok(
+        command_output(&git, &path, &["remote", "get-url", "origin"])
+            .ok()
+            .and_then(|remote| browse_url(&remote)),
+    )
+}
+
 #[tauri::command]
 async fn read_usage(
     app: AppHandle,
@@ -2225,6 +2273,7 @@ pub fn run() {
             list_directory,
             read_text_file,
             git_status,
+            git_remote,
             read_usage,
             agent_availability,
             open_setup_docs,

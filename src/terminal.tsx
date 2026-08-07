@@ -154,7 +154,14 @@ export function TerminalView({
         rows: terminal.rows,
       });
     };
-    const observer = new ResizeObserver(() => requestAnimationFrame(resize));
+    // A width change arrives as a stream of frames: a drag, or the ease a collapsing panel runs
+    // through. Fitting on each one rewraps the scrollback and hands the child a window size it is
+    // never shown at, so the terminal is fitted once the size has settled.
+    let settle = 0;
+    const observer = new ResizeObserver(() => {
+      window.clearTimeout(settle);
+      settle = window.setTimeout(resize, 100);
+    });
     observer.observe(container);
     // Command and the zoom keys resize the type, as they do in a terminal app.
     terminal.attachCustomKeyEventHandler((event) => {
@@ -171,6 +178,7 @@ export function TerminalView({
     terminal.focus();
 
     return () => {
+      window.clearTimeout(settle);
       observer.disconnect();
       input.dispose();
       unsubscribe();
@@ -188,9 +196,10 @@ export function TerminalView({
   // and it only subtracts padding declared on the terminal's own element. Padding here would be
   // counted as usable space, so the terminal laid out a row and three columns more than fit and hung
   // them past the edge, which also left the last row below the viewport where the scrollbar could
-  // neither show nor reach it.
+  // neither show nor reach it. The bottom gutter is deeper than the rest for the same reason it is
+  // there at all: the row the terminal cannot quite fit should end above the edge, not against it.
   return (
-    <div className="h-full w-full bg-background p-3">
+    <div className="h-full w-full bg-background p-3 pb-6">
       <div ref={containerRef} className="h-full w-full" />
     </div>
   );

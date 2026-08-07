@@ -1,17 +1,60 @@
 // Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import { invoke } from "@tauri-apps/api/core";
-import { ChartNoAxesColumn, ChevronRight, File, Folder, GitBranch, RefreshCw, X } from "lucide-react";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import {
+  ChartNoAxesColumn,
+  ChevronLeft,
+  ChevronRight,
+  File,
+  Folder,
+  GitBranch,
+  GitPullRequest,
+  RefreshCw,
+  X,
+} from "lucide-react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { ActionIconButton } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { readOutput } from "@/output-store";
 import type { DirectoryCursor, DirectoryListing, FileEntry, GitStatus, Session } from "@/types";
 
 const CodePreview = lazy(() => import("@/code-preview"));
+
+// A session's terminal is the only record of what it worked on, so what it named is read back out of
+// the output Lite already keeps. Only what Git and GitHub print verbatim counts: a whole pull request
+// link, and the two sentences Git answers a checkout with. A bare "#12" is as often a line number.
+// Only CSI is stripped, so a link inside an OSC hyperlink survives being uncoloured.
+// biome-ignore lint/suspicious/noControlCharactersInRegex: a color code has to be named to be removed.
+const COLOR = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+const PULL_REQUEST = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
+const BRANCH = /(?:On branch|Switched to(?: a new)? branch) '?([\w./-]+)'?/g;
+
+function namedInSession(sessionId: string) {
+  const text = readOutput(sessionId).replace(COLOR, "");
+  return {
+    branches: [...new Set([...text.matchAll(BRANCH)].map((match) => match[1]))],
+    pulls: [...new Set(text.match(PULL_REQUEST) ?? [])],
+  };
+}
+
+// A pull request is known by its number and the repository it belongs to, not by the URL that reaches it.
+function pullLabel(url: string) {
+  const [owner, repository, , number] = url.split("/").slice(3);
+  return `${owner}/${repository} #${number}`;
+}
+
+// One list so a tab, its icon and the name every surface calls it by cannot drift apart, including the
+// rail the panel collapses to.
+const TABS = [
+  { value: "files", label: "Files", icon: Folder },
+  { value: "git", label: "Git", icon: GitBranch },
+  { value: "usage", label: "Usage", icon: ChartNoAxesColumn },
+] as const;
 
 // Every optional field arrives from Serde as null, never as a missing key.
 interface UsageWindow {
@@ -58,9 +101,12 @@ function Meter({ value }: { value: number }) {
 
 function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOpen: (entry: FileEntry) => void }) {
   const [children, setChildren] = useState<Record<string, DirectoryListing & { after: DirectoryCursor | null }>>({});
-  const [expanded, setExpanded] = useState(() => new Set<string>());
+  // The root is the folder the session works in; showing it shut asks for a click to say what the
+  // panel is already for, so it opens with the tree it was asked to show.
+  const [expanded, setExpanded] = useState(() => new Set<string>([root]));
   const loading = useRef(new Set<string>());
   const [loadingPaths, setLoadingPaths] = useState(() => new Set<string>());
+  const [error, setError] = useState("");
 
   const load = useCallback(
     async (path: string, after: DirectoryCursor | null = null) => {
@@ -70,6 +116,11 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
       try {
         const listing = await invoke<DirectoryListing>("list_directory", { rootId, path, after });
         setChildren((current) => ({ ...current, [path]: { ...listing, after } }));
+        setError("");
+      } catch (reason) {
+        // The panel opens its own root now, so a folder that has moved since the session was made says
+        // so rather than drawing an empty tree nobody asked for.
+        setError(String(reason));
       } finally {
         loading.current.delete(path);
         setLoadingPaths((current) => {
@@ -81,6 +132,10 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
     },
     [rootId],
   );
+
+  useEffect(() => {
+    void load(root);
+  }, [load, root]);
 
   async function toggle(path: string) {
     const next = new Set(expanded);
@@ -94,7 +149,10 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
 
   function rows(path: string, depth = 0): React.ReactNode {
     const listing = children[path];
-    if (!listing) return loadingPaths.has(path) ? <Loading label="Reading folder…" /> : null;
+    if (!listing) {
+      if (loadingPaths.has(path)) return <Loading label="Reading folder…" />;
+      return error ? <p className="p-3 text-xs text-destructive">{error}</p> : null;
+    }
     return (
       <>
         {listing.entries.map((entry) => (
@@ -192,9 +250,15 @@ function FilesPanel({ root, rootId }: { root: string; rootId: string }) {
         <div className="flex h-9 shrink-0 items-center gap-2 border-b px-2">
           <File className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1 truncate font-mono text-xs">{selected.name}</span>
-          <Button variant="ghost" size="icon-xs" onClick={() => setSelected(null)} aria-label="Close file">
+          <ActionIconButton
+            variant="ghost"
+            size="icon-sm"
+            tooltip="Close file"
+            aria-label="Close file"
+            onClick={() => setSelected(null)}
+          >
             <X />
-          </Button>
+          </ActionIconButton>
         </div>
         <ScrollArea className="min-h-0 flex-1">
           {error ? (
@@ -217,7 +281,10 @@ function FilesPanel({ root, rootId }: { root: string; rootId: string }) {
   );
 }
 
-function GitPanel({ rootId }: { rootId: string }) {
+function GitPanel({ rootId, sessionId }: { rootId: string; sessionId: string }) {
+  // Read once when the panel is built, like every other thing this panel shows: the refresh button
+  // rebuilds it, and nothing here watches the session between those two moments.
+  const named = useMemo(() => namedInSession(sessionId), [sessionId]);
   const [status, setStatus] = useState<GitStatus | null>();
   const [error, setError] = useState("");
 
@@ -275,6 +342,32 @@ function GitPanel({ rootId }: { rootId: string }) {
                   ))}
                 </div>
               ) : null}
+              <div className="mt-4">
+                <p className="mb-2 font-medium">Named in this session</p>
+                {named.branches.map((branch) => (
+                  <div key={branch} className="flex items-center gap-2 rounded-md px-2 py-1.5">
+                    <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="truncate font-mono">{branch}</span>
+                  </div>
+                ))}
+                {named.pulls.map((url) => (
+                  <button
+                    key={url}
+                    type="button"
+                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted"
+                    title={url}
+                    onClick={() => void invoke("open_url", { url })}
+                  >
+                    <GitPullRequest className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="truncate font-mono underline-offset-2 hover:underline">{pullLabel(url)}</span>
+                  </button>
+                ))}
+                {named.branches.length || named.pulls.length ? null : (
+                  <p className="px-2 text-muted-foreground">
+                    Branches this session checked out and pull request links it printed appear here.
+                  </p>
+                )}
+              </div>
             </>
           )}
         </div>
@@ -380,46 +473,106 @@ function UsagePanel({ session }: { session: Session }) {
   );
 }
 
-export function Inspector({ session }: { session: Session }) {
-  const [tab, setTab] = useState("files");
+export function Inspector({
+  session,
+  collapsed,
+  onExpand,
+  onCollapse,
+}: {
+  session: Session;
+  collapsed: boolean;
+  onExpand: () => void;
+  onCollapse: () => void;
+}) {
+  const [tab, setTab] = useState<string>(TABS[0].value);
   // A tab already names the panel it shows, so the panel does not name itself again. One button beside
   // the tabs rereads whichever is open, by rebuilding it, and only that one ever reads the disk.
   const [reload, setReload] = useState({ files: 0, git: 0, usage: 0 });
 
+  // Collapsed, the panel is the strip of tabs it collapsed from: the one you pick is the one it reopens
+  // on. What it was showing is hidden rather than thrown away, so the file you had open is still open
+  // when it comes back, and a hidden panel reads nothing because nothing here reads without being asked.
+  const rail = (
+    <div className="flex animate-in flex-col items-center gap-0.5 py-1.5 fade-in duration-200">
+      <ActionIconButton
+        variant="ghost"
+        size="icon-sm"
+        tooltip="Expand panel"
+        tooltipSide="left"
+        aria-label="Expand panel"
+        onClick={onExpand}
+      >
+        <ChevronLeft />
+      </ActionIconButton>
+      {TABS.map(({ value, label, icon: Icon }) => (
+        <ActionIconButton
+          key={value}
+          variant="ghost"
+          size="icon-sm"
+          tooltip={label}
+          tooltipSide="left"
+          aria-label={label}
+          onClick={() => {
+            setTab(value);
+            onExpand();
+          }}
+        >
+          <Icon />
+        </ActionIconButton>
+      ))}
+    </div>
+  );
+
   return (
-    <Tabs value={tab} onValueChange={setTab} className="h-full min-h-0 gap-0">
-      <div className="flex h-11 shrink-0 items-center justify-between border-b px-3">
-        <TabsList variant="line">
-          <TabsTrigger value="files" aria-label="Files">
-            <Folder />
-          </TabsTrigger>
-          <TabsTrigger value="git" aria-label="Git">
-            <GitBranch />
-          </TabsTrigger>
-          <TabsTrigger value="usage" aria-label="Usage">
-            <ChartNoAxesColumn />
-          </TabsTrigger>
-        </TabsList>
-        {tab === "usage" && session.agent === "shell" ? null : (
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            onClick={() => setReload((counts) => ({ ...counts, [tab]: counts[tab as keyof typeof counts] + 1 }))}
-            aria-label="Refresh"
-          >
-            <RefreshCw />
-          </Button>
-        )}
+    <>
+      {collapsed ? rail : null}
+      <div className={collapsed ? "hidden" : "h-full"}>
+        <Tabs value={tab} onValueChange={setTab} className="h-full min-h-0 gap-0">
+          <div className="flex h-11 shrink-0 items-center gap-0.5 border-b pr-3 pl-1.5">
+            <ActionIconButton
+              variant="ghost"
+              size="icon-sm"
+              tooltip="Collapse panel"
+              aria-label="Collapse panel"
+              onClick={onCollapse}
+            >
+              <ChevronRight />
+            </ActionIconButton>
+            <TabsList variant="line">
+              {TABS.map(({ value, label, icon: Icon }) => (
+                <Tooltip key={value}>
+                  <TooltipTrigger render={<TabsTrigger value={value} aria-label={label} />}>
+                    <Icon />
+                  </TooltipTrigger>
+                  <TooltipContent>{label}</TooltipContent>
+                </Tooltip>
+              ))}
+            </TabsList>
+            <span className="ml-auto flex items-center">
+              {tab === "usage" && session.agent === "shell" ? null : (
+                <ActionIconButton
+                  variant="ghost"
+                  size="icon-sm"
+                  tooltip="Refresh"
+                  aria-label="Refresh"
+                  onClick={() => setReload((counts) => ({ ...counts, [tab]: counts[tab as keyof typeof counts] + 1 }))}
+                >
+                  <RefreshCw />
+                </ActionIconButton>
+              )}
+            </span>
+          </div>
+          <TabsContent value="files" className="min-h-0 overflow-hidden">
+            <FilesPanel key={reload.files} root={session.cwd} rootId={session.rootId} />
+          </TabsContent>
+          <TabsContent value="git" className="min-h-0 overflow-hidden">
+            <GitPanel key={reload.git} rootId={session.rootId} sessionId={session.id} />
+          </TabsContent>
+          <TabsContent value="usage" className="min-h-0 overflow-hidden">
+            <UsagePanel key={reload.usage} session={session} />
+          </TabsContent>
+        </Tabs>
       </div>
-      <TabsContent value="files" className="min-h-0 overflow-hidden">
-        <FilesPanel key={reload.files} root={session.cwd} rootId={session.rootId} />
-      </TabsContent>
-      <TabsContent value="git" className="min-h-0 overflow-hidden">
-        <GitPanel key={reload.git} rootId={session.rootId} />
-      </TabsContent>
-      <TabsContent value="usage" className="min-h-0 overflow-hidden">
-        <UsagePanel key={reload.usage} session={session} />
-      </TabsContent>
-    </Tabs>
+    </>
   );
 }

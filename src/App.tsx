@@ -5,6 +5,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  ChevronLeft,
+  ChevronRight,
+  GitBranch,
   KeyRound,
   Moon,
   MoreHorizontal,
@@ -12,6 +15,7 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  Search,
   SquareTerminal,
   Sun,
   Trash2,
@@ -21,9 +25,10 @@ import { Component, lazy, type ReactNode, Suspense, useCallback, useEffect, useM
 
 import { LiteLogomark, ProviderIcon } from "@/brand-icons";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { ActionIconButton, Button } from "@/components/ui/button";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -40,7 +45,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+import {
+  type PanelImperativeHandle,
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@/components/ui/resizable";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Spinner } from "@/components/ui/spinner";
@@ -54,6 +64,58 @@ import { type Session, sessionLabel } from "@/types";
 import "./App.css";
 
 const STORAGE_KEY = "lite.sessions.v1";
+// The width each side collapses to: one icon button and the room around it.
+const RAIL = 44;
+// Where a side stops following the pointer. It has no room to be anything but its rail by here, so it
+// becomes one and collapses the rest of the way itself, in one eased step.
+const SHUT = 140;
+// A side reopens to the share of the window it started with, in the pixels a glide is measured in.
+function share(panel: PanelImperativeHandle | null, portion: string) {
+  const size = panel?.getSize();
+  if (!size || !size.asPercentage) return 0;
+  return Math.round((size.inPixels / size.asPercentage) * Number.parseFloat(portion));
+}
+
+// How long a side takes to open or close under its own power.
+const GLIDE_MS = 200;
+
+// The library reads every size back off the elements it laid out, so a CSS transition on a panel feeds
+// its own animation into the next layout and the two fight — measurably: an expanding panel is read as
+// one being dragged shut and pulled closed again. The ease is driven here instead, a resize per frame,
+// so what the library measures is always what it was last told. A drag owns the panel outright, so a
+// glide gets out of the way the moment one starts.
+const glides = new WeakMap<PanelImperativeHandle, number>();
+function glide(panel: PanelImperativeHandle | null, to: number) {
+  if (!panel) return;
+  // One glide owns a side at a time. Two would drive the same panel from two captured widths at once,
+  // which is what shutting a side and reopening it inside the same fifth of a second asks for.
+  const turn = (glides.get(panel) ?? 0) + 1;
+  glides.set(panel, turn);
+  const from = panel.getSize().inPixels;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches || from === to) {
+    panel.resize(`${to}px`);
+    return;
+  }
+  const started = performance.now();
+  const step = (now: number) => {
+    if (glides.get(panel) !== turn || document.querySelector("[data-separator=active]")) return;
+    const part = Math.min(1, (now - started) / GLIDE_MS);
+    try {
+      // Ease out: fastest at the start, so the side answers the click before it settles.
+      panel.resize(`${Math.round(from + (to - from) * (1 - (1 - part) ** 3))}px`);
+    } catch {
+      // A panel that has gone away — the inspector leaving with the last session — cannot be asked
+      // whether it is still there, only told to resize, so this is the one way to hear that it is not.
+      return;
+    }
+    if (part < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+const SIDES = {
+  sidebar: { size: "20%", max: "30%" },
+  inspector: { size: "25%", max: "40%" },
+} as const;
 const TerminalView = lazy(() => import("@/terminal").then((module) => ({ default: module.TerminalView })));
 // The version is known from the start, so the badge shows it throughout and only its color waits on
 // the answer: grey while asking, which is quieter than a spinner that would resize a chip this small.
@@ -171,6 +233,39 @@ class PanelBoundary extends Component<{ children: ReactNode }, { message: string
   }
 }
 
+// What a session looks like at a glance: who runs it and whether it is up. The sidebar row and the rail
+// it collapses to show the same one, so a session is recognizable at either width.
+function SessionBadge({
+  session,
+  active,
+  starting,
+  working,
+}: {
+  session: Session;
+  active: boolean;
+  starting: boolean;
+  working: boolean;
+}) {
+  const status = SESSION_STATUS[!session.running ? "disconnected" : working ? "working" : "idle"];
+  const ring = active ? "ring-sidebar-accent" : "ring-sidebar";
+  return (
+    <span className="relative flex size-7 shrink-0 items-center justify-center rounded-md border bg-background">
+      <ProviderIcon agent={session.agent} provider={session.provider} />
+      {starting ? (
+        <Spinner
+          className={`absolute -right-1 -bottom-1 size-3 rounded-full bg-background text-muted-foreground ring-2 ${ring}`}
+        />
+      ) : (
+        <span
+          role="img"
+          className={`absolute -right-0.5 -bottom-0.5 size-2 rounded-full ring-2 ${ring} ${status.dot}`}
+          aria-label={status.label}
+        />
+      )}
+    </span>
+  );
+}
+
 function SessionRow({
   session,
   active,
@@ -190,7 +285,6 @@ function SessionRow({
   onRestart: () => void;
   onClose: () => void;
 }) {
-  const status = SESSION_STATUS[!session.running ? "disconnected" : working ? "working" : "idle"];
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(session.name);
 
@@ -206,20 +300,7 @@ function SessionRow({
       className={`group flex items-center rounded-lg pr-1 ${active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/60"}`}
     >
       <div className="flex min-w-0 flex-1 items-center gap-2.5 py-1.5 pl-2">
-        <span className="relative flex size-7 shrink-0 items-center justify-center rounded-md border bg-background">
-          <ProviderIcon agent={session.agent} provider={session.provider} />
-          {starting ? (
-            <Spinner
-              className={`absolute -right-1 -bottom-1 size-3 rounded-full bg-background text-muted-foreground ring-2 ${active ? "ring-sidebar-accent" : "ring-sidebar"}`}
-            />
-          ) : (
-            <span
-              role="img"
-              className={`absolute -right-0.5 -bottom-0.5 size-2 rounded-full ring-2 ${active ? "ring-sidebar-accent" : "ring-sidebar"} ${status.dot}`}
-              aria-label={status.label}
-            />
-          )}
-        </span>
+        <SessionBadge session={session} active={active} starting={starting} working={working} />
         {renaming ? (
           <span className="min-w-0 flex-1 py-0.5">
             <Input
@@ -239,12 +320,13 @@ function SessionRow({
             />
           </span>
         ) : (
-          /* Clicking a session opens it; clicking the one already open edits its name, so a name is
-             reachable without a menu and a click never surprises you with a text field. */
+          /* Clicking a session opens it, and a stopped one comes back with it. Only the session already
+             open and running reads a click as a rename, so a name is still reachable without a menu and
+             a click never surprises you with a text field. */
           <button
             type="button"
             className="min-w-0 flex-1 py-0.5 text-left"
-            onClick={() => (active ? setRenaming(true) : onSelect())}
+            onClick={() => (active && session.running ? setRenaming(true) : onSelect())}
             onDoubleClick={() => setRenaming(true)}
             title={session.cwd}
           >
@@ -255,40 +337,29 @@ function SessionRow({
           </button>
         )}
       </div>
-      <span className="flex shrink-0 items-center opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                disabled={starting}
-                onClick={onRestart}
-                aria-label={`Restart ${session.name}`}
-              />
-            }
-          >
-            <RotateCcw />
-          </TooltipTrigger>
-          <TooltipContent>Restart</TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                disabled={starting}
-                className="hover:text-destructive"
-                onClick={onClose}
-                aria-label={`Close ${session.name}`}
-              />
-            }
-          >
-            <Trash2 />
-          </TooltipTrigger>
-          <TooltipContent>Close session</TooltipContent>
-        </Tooltip>
+      {/* Hidden rather than transparent, so a name gets the whole row until the pointer arrives. */}
+      <span className="hidden shrink-0 items-center group-hover:flex group-focus-within:flex">
+        <ActionIconButton
+          variant="ghost"
+          size="icon-sm"
+          tooltip="Restart"
+          aria-label={`Restart ${session.name}`}
+          disabled={starting}
+          onClick={onRestart}
+        >
+          <RotateCcw />
+        </ActionIconButton>
+        <ActionIconButton
+          variant="ghost"
+          size="icon-sm"
+          className="hover:text-destructive"
+          tooltip="Close session"
+          aria-label={`Close ${session.name}`}
+          disabled={starting}
+          onClick={onClose}
+        >
+          <Trash2 />
+        </ActionIconButton>
       </span>
     </div>
   );
@@ -320,6 +391,11 @@ function folderName(cwd: string) {
   return cwd.split(/[\\/]/).filter(Boolean).pop() ?? "Session";
 }
 
+// A remote names a repository; the scheme and host that reach it are the tooltip's job.
+function repoName(url: string) {
+  return url.replace(/^https:\/\/[^/]+\//, "");
+}
+
 // Paths truncate from the right, which hides the part that identifies the folder, so only its tail shows.
 function shortPath(cwd: string) {
   const parts = cwd.split(/[\\/]/).filter(Boolean);
@@ -344,6 +420,14 @@ function App() {
   // Sessions whose terminal has written something recently, which is what separates a connected
   // session that is working from one that is merely connected.
   const [working, setWorking] = useState<Set<string>>(new Set());
+  const [query, setQuery] = useState("");
+  // Each side collapses to a rail of icons rather than to nothing, so the panel is still there to click
+  // or drag back open. Dragging past the minimum is what collapses it; the handle never goes away.
+  const [shut, setShut] = useState({ sidebar: false, inspector: false });
+  const sidebarPanel = useRef<PanelImperativeHandle>(null);
+  const inspectorPanel = useRef<PanelImperativeHandle>(null);
+  // The browse URL of the selected folder's origin, empty when it has none or Lite cannot open it.
+  const [remote, setRemote] = useState("");
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [version, setVersion] = useState("");
   // Undefined until asked: an empty string is a release, anything else is the commit it was built from.
@@ -358,12 +442,20 @@ function App() {
   const workTimers = useRef(new Map<string, number>());
   const resumed = useRef("");
   const themeRef = useRef<Theme>("dark");
-  const sessionsRef = useRef<Session[]>([]);
+  const visibleRef = useRef<Session[]>([]);
   const selectedRef = useRef<Session>(undefined);
   const closeRef = useRef<(session: Session) => void>(() => {});
   const openRef = useRef<(session: Session) => void>(() => {});
   const selected = useMemo(() => sessions.find((session) => session.id === selectedId), [sessions, selectedId]);
-  sessionsRef.current = sessions;
+  // A session is found by what names it: the subject it was given and the folder it works in.
+  const visible = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return sessions;
+    return sessions.filter(
+      (session) => session.name.toLowerCase().includes(needle) || session.cwd.toLowerCase().includes(needle),
+    );
+  }, [sessions, query]);
+  visibleRef.current = visible;
   themeRef.current = theme;
   selectedRef.current = selected;
   closeRef.current = setClosing;
@@ -371,6 +463,37 @@ function App() {
     setSelectedId(session.id);
     if (!session.running) void launch(session, true);
   };
+
+  // A drag reports every frame, so a side changes state only when the answer changes: handing back the
+  // same object leaves React with nothing to redraw while the divider moves.
+  const rail = useCallback((side: keyof typeof SIDES, size: { inPixels: number }) => {
+    const next = size.inPixels < SHUT;
+    // A shut sidebar has nowhere to show a search field, so the filter closes with it rather than
+    // leaving the rail and the number shortcuts counting two different lists.
+    if (side === "sidebar" && next) setQuery("");
+    setShut((current) => (current[side] === next ? current : { ...current, [side]: next }));
+  }, []);
+
+  // The inspector panel goes away with the last session and comes back at its default width, so what
+  // the sides remember about it is reset with it rather than corrected by the first measurement.
+  const hasSelection = Boolean(selected);
+  useEffect(() => {
+    if (!hasSelection) setShut((current) => (current.inspector ? { ...current, inspector: false } : current));
+  }, [hasSelection]);
+
+  // A side dragged under the width where it can only be a rail is a side being closed, so it closes
+  // the rest of the way once the pointer lets go of it rather than sitting at whatever width the hand
+  // happened to stop at. Under the pointer it stays exactly where the pointer put it.
+  useEffect(() => {
+    const settle = () => {
+      for (const panel of [sidebarPanel.current, inspectorPanel.current]) {
+        const width = panel?.getSize().inPixels;
+        if (panel && width !== undefined && width < SHUT && width > RAIL) glide(panel, RAIL);
+      }
+    };
+    window.addEventListener("pointerup", settle);
+    return () => window.removeEventListener("pointerup", settle);
+  }, []);
 
   useEffect(() => {
     applyTheme(theme);
@@ -396,7 +519,8 @@ function App() {
       else if (event.key === ",") setSettingsOpen(true);
       else if (event.key === "w" && selectedRef.current) closeRef.current(selectedRef.current);
       else if (event.key >= "1" && event.key <= "9") {
-        const target = sessionsRef.current[Number(event.key) - 1];
+        // The numbers count the sessions the sidebar is showing, so a search narrows them with the list.
+        const target = visibleRef.current[Number(event.key) - 1];
         if (!target) return;
         // Reaching a session by number is the same act as clicking it, including bringing it back.
         openRef.current(target);
@@ -575,6 +699,23 @@ function App() {
     void launch(selected, true);
   }, [selected, launch]);
 
+  // Which repository a folder was cloned from is a fact about the folder, so it is asked for once when
+  // the selection changes and never watched.
+  const rootId = selected?.rootId ?? "";
+  useEffect(() => {
+    setRemote("");
+    if (!rootId) return;
+    let cancelled = false;
+    void invoke<string | null>("git_remote", { rootId })
+      .then((url) => {
+        if (!cancelled) setRemote(url ?? "");
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [rootId]);
+
   async function signIn(agent: Session["agent"]) {
     setSettingsOpen(false);
     try {
@@ -710,6 +851,23 @@ function App() {
               <ProviderIcon agent={selected.agent} provider={selected.provider} />
               <span className="min-w-0 truncate text-xs font-medium">{selected.name}</span>
               <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{selected.cwd}</span>
+              {remote ? (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <button
+                        type="button"
+                        className="flex max-w-56 shrink-0 items-center gap-1.5 text-muted-foreground hover:text-foreground"
+                        onClick={() => void invoke("open_url", { url: remote })}
+                      />
+                    }
+                  >
+                    <GitBranch className="size-3.5 shrink-0" />
+                    <span className="truncate font-mono text-[11px]">{repoName(remote)}</span>
+                  </TooltipTrigger>
+                  <TooltipContent>Open {remote}</TooltipContent>
+                </Tooltip>
+              ) : null}
             </>
           ) : (
             <span className="text-sm font-semibold">Lite</span>
@@ -733,9 +891,16 @@ function App() {
               <TooltipContent>{theme === "dark" ? "Light mode" : "Dark mode"}</TooltipContent>
             </Tooltip>
             <DropdownMenu>
-              <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Lite menu" />}>
-                <MoreHorizontal />
-              </DropdownMenuTrigger>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Options" />} />
+                  }
+                >
+                  <MoreHorizontal />
+                </TooltipTrigger>
+                <TooltipContent>Options</TooltipContent>
+              </Tooltip>
               <DropdownMenuContent align="end" className="w-48">
                 {version ? (
                   <DropdownMenuGroup>
@@ -758,50 +923,126 @@ function App() {
           </div>
         </header>
         <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
-          <ResizablePanel defaultSize="20%" minSize="15%" maxSize="30%" collapsible collapsedSize="0%">
+          <ResizablePanel
+            panelRef={sidebarPanel}
+            defaultSize={SIDES.sidebar.size}
+            minSize={RAIL}
+            maxSize={SIDES.sidebar.max}
+            onResize={(size) => rail("sidebar", size)}
+          >
             <aside className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
-              <div className="flex h-9 shrink-0 items-center justify-between pr-1.5 pl-3">
-                <span className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">Sessions</span>
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        onClick={() => setNewSessionOpen(true)}
-                        aria-label="New session"
+              {shut.sidebar ? (
+                <ScrollArea className="min-h-0 flex-1">
+                  <div className="flex animate-in flex-col items-center gap-0.5 py-1.5 fade-in duration-200">
+                    <ActionIconButton
+                      variant="ghost"
+                      size="icon-sm"
+                      tooltip="Expand sessions"
+                      tooltipSide="right"
+                      aria-label="Expand sessions"
+                      onClick={() => glide(sidebarPanel.current, share(sidebarPanel.current, SIDES.sidebar.size))}
+                    >
+                      <ChevronRight />
+                    </ActionIconButton>
+                    <ActionIconButton
+                      variant="ghost"
+                      size="icon-sm"
+                      tooltip="New session"
+                      tooltipSide="right"
+                      aria-label="New session"
+                      onClick={() => setNewSessionOpen(true)}
+                    >
+                      <Plus />
+                    </ActionIconButton>
+                    {sessions.map((session) => (
+                      <Tooltip key={session.id}>
+                        <TooltipTrigger
+                          render={
+                            <button
+                              type="button"
+                              aria-pressed={session.id === selectedId}
+                              className={`rounded-lg p-1 ${session.id === selectedId ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/60"}`}
+                              onClick={() => openRef.current(session)}
+                            />
+                          }
+                        >
+                          <SessionBadge
+                            session={session}
+                            active={session.id === selectedId}
+                            starting={startingIds.has(session.id)}
+                            working={working.has(session.id)}
+                          />
+                        </TooltipTrigger>
+                        <TooltipContent side="right">{session.name}</TooltipContent>
+                      </Tooltip>
+                    ))}
+                  </div>
+                </ScrollArea>
+              ) : (
+                <>
+                  {/* The search field names the panel and searches it, so the list keeps the row a title would cost. */}
+                  <div className="flex h-9 shrink-0 items-center gap-0.5 pr-1.5 pl-2">
+                    <span className="relative min-w-0 flex-1">
+                      <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        value={query}
+                        className="h-7 pl-7 text-xs md:text-xs"
+                        placeholder="Search sessions"
+                        aria-label="Search sessions"
+                        onChange={(event) => setQuery(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Escape") setQuery("");
+                        }}
                       />
-                    }
-                  >
-                    <Plus />
-                  </TooltipTrigger>
-                  <TooltipContent>New session</TooltipContent>
-                </Tooltip>
-              </div>
-              <ScrollArea className="min-h-0 flex-1">
-                <div className="space-y-0.5 px-2 pb-2">
-                  {sessions.map((session) => (
-                    <SessionRow
-                      key={session.id}
-                      session={session}
-                      active={session.id === selectedId}
-                      starting={startingIds.has(session.id)}
-                      working={working.has(session.id)}
-                      onSelect={() => openRef.current(session)}
-                      onRename={(name) =>
-                        setSessions((current) =>
-                          current.map((item) => (item.id === session.id ? { ...item, name } : item)),
-                        )
-                      }
-                      onRestart={() => void restartSession(session)}
-                      onClose={() => setClosing(session)}
-                    />
-                  ))}
-                </div>
-              </ScrollArea>
+                    </span>
+                    <ActionIconButton
+                      variant="ghost"
+                      size="icon-sm"
+                      tooltip="New session"
+                      aria-label="New session"
+                      onClick={() => setNewSessionOpen(true)}
+                    >
+                      <Plus />
+                    </ActionIconButton>
+                    <ActionIconButton
+                      variant="ghost"
+                      size="icon-sm"
+                      tooltip="Collapse sessions"
+                      aria-label="Collapse sessions"
+                      onClick={() => glide(sidebarPanel.current, RAIL)}
+                    >
+                      <ChevronLeft />
+                    </ActionIconButton>
+                  </div>
+                  <ScrollArea className="min-h-0 flex-1">
+                    <div className="space-y-0.5 px-2 pb-2">
+                      {query && !visible.length ? (
+                        <p className="px-2 py-1.5 text-xs text-muted-foreground">No session matches “{query}”.</p>
+                      ) : null}
+                      {visible.map((session) => (
+                        <SessionRow
+                          key={session.id}
+                          session={session}
+                          active={session.id === selectedId}
+                          starting={startingIds.has(session.id)}
+                          working={working.has(session.id)}
+                          onSelect={() => openRef.current(session)}
+                          onRename={(name) =>
+                            setSessions((current) =>
+                              current.map((item) => (item.id === session.id ? { ...item, name } : item)),
+                            )
+                          }
+                          onRestart={() => void restartSession(session)}
+                          onClose={() => setClosing(session)}
+                        />
+                      ))}
+                    </div>
+                  </ScrollArea>
+                </>
+              )}
             </aside>
           </ResizablePanel>
-          <ResizableHandle />
+          <ResizableHandle withHandle />
           <ResizablePanel defaultSize="55%" minSize="38%">
             <section className="flex h-full min-w-0 flex-col">
               {selected ? (
@@ -872,11 +1113,24 @@ function App() {
           </ResizablePanel>
           {selected ? (
             <>
-              <ResizableHandle />
-              <ResizablePanel defaultSize="25%" minSize="18%" maxSize="40%">
+              <ResizableHandle withHandle />
+              <ResizablePanel
+                panelRef={inspectorPanel}
+                defaultSize={SIDES.inspector.size}
+                minSize={RAIL}
+                maxSize={SIDES.inspector.max}
+                onResize={(size) => rail("inspector", size)}
+              >
                 <aside className="h-full border-l">
                   <PanelBoundary key={selected.id}>
-                    <Inspector session={selected} />
+                    <Inspector
+                      session={selected}
+                      collapsed={shut.inspector}
+                      onExpand={() =>
+                        glide(inspectorPanel.current, share(inspectorPanel.current, SIDES.inspector.size))
+                      }
+                      onCollapse={() => glide(inspectorPanel.current, RAIL)}
+                    />
                   </PanelBoundary>
                 </aside>
               </ResizablePanel>
@@ -918,7 +1172,9 @@ function App() {
               </DialogDescription>
             </DialogHeader>
             {updateStatus === "checking" || updateStatus === "installing" ? (
-              <Spinner className="mx-auto size-5 text-muted-foreground" />
+              <DialogBody>
+                <Spinner className="mx-auto size-5 text-muted-foreground" />
+              </DialogBody>
             ) : null}
             {updateStatus === "available" ? (
               <DialogFooter>
@@ -941,7 +1197,7 @@ function App() {
           </DialogContent>
         </Dialog>
         <Dialog open={Boolean(closing)} onOpenChange={(open) => !open && setClosing(undefined)}>
-          <DialogContent className="sm:max-w-sm">
+          <DialogContent size="sm">
             <DialogHeader>
               <DialogTitle>Close {closing?.name}?</DialogTitle>
               <DialogDescription>
