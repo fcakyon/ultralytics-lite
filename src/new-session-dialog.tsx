@@ -1,10 +1,10 @@
 // Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import { invoke } from "@tauri-apps/api/core";
-import { FolderOpen, TerminalSquare } from "lucide-react";
+import { FolderOpen } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { ClaudeLogomark, OpenAILogomark } from "@/brand-icons";
+import { ProviderIcon } from "@/brand-icons";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -15,37 +15,40 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import type { Agent, Session } from "@/types";
+import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { type Agent, type ModelProvider, type Session, sessionLabel } from "@/types";
 
-const agents: {
-  id: Agent;
-  label: string;
+interface Choice {
+  id: string;
+  agent: Agent;
+  provider?: ModelProvider;
   description: string;
-  icon: React.ReactNode;
-}[] = [
+  note?: string;
+}
+
+const choices: Choice[] = [
+  { id: "claude", agent: "claude", description: "Use your Anthropic account" },
+  { id: "codex", agent: "codex", provider: "openai", description: "Use your OpenAI account" },
   {
-    id: "claude",
-    label: "Claude Code",
-    description: "Use your Anthropic account",
-    icon: <ClaudeLogomark className="size-5" />,
+    id: "codex-deepseek",
+    agent: "codex",
+    provider: "deepseek",
+    description: "Codex, billed to DeepSeek",
+    note: "Runs the Codex harness against the DeepSeek provider in your Codex configuration. Usage bills DeepSeek, not OpenAI.",
   },
-  {
-    id: "codex",
-    label: "Codex",
-    description: "Use your OpenAI account",
-    icon: <OpenAILogomark className="size-5" />,
-  },
-  {
-    id: "shell",
-    label: "Shell",
-    description: "Open your default shell",
-    icon: <TerminalSquare className="size-5" />,
-  },
+  { id: "kimi", agent: "kimi", description: "Use your Kimi Code account" },
+  { id: "shell", agent: "shell", description: "Open your default shell" },
 ];
 
 interface DirectoryGrant {
   id: string;
   path: string;
+}
+
+interface Availability {
+  available: boolean;
+  detail: string;
 }
 
 export function NewSessionDialog({
@@ -57,22 +60,38 @@ export function NewSessionDialog({
   onOpenChange: (open: boolean) => void;
   onCreate: (session: Session) => void;
 }) {
-  const [agent, setAgent] = useState<Agent>("claude");
+  const [choiceId, setChoiceId] = useState(choices[0].id);
   const [directory, setDirectory] = useState<DirectoryGrant>();
+  const [path, setPath] = useState("");
+  const [availability, setAvailability] = useState<Record<string, Availability>>({});
   const [error, setError] = useState("");
+  const choice = choices.find((option) => option.id === choiceId) ?? choices[0];
+  const status = availability[choice.id];
 
   useEffect(() => {
     if (!isOpen) return;
     let disposed = false;
     setError("");
+    setAvailability({});
     void invoke<DirectoryGrant>("default_directory")
       .then((selected) => {
         if (disposed) void invoke("revoke_directory", { rootId: selected.id });
-        else setDirectory(selected);
+        else {
+          setDirectory(selected);
+          setPath(selected.path);
+        }
       })
       .catch((reason) => {
         if (!disposed) setError(String(reason));
       });
+    // Checked only while the dialog is open, so Lite never probes the system in the background.
+    for (const option of choices) {
+      void invoke<Availability>("agent_availability", { agent: option.agent, provider: option.provider })
+        .then((result) => {
+          if (!disposed) setAvailability((current) => ({ ...current, [option.id]: result }));
+        })
+        .catch(() => {});
+    }
     return () => {
       disposed = true;
     };
@@ -85,9 +104,25 @@ export function NewSessionDialog({
       if (selected) {
         if (directory) void invoke("revoke_directory", { rootId: directory.id });
         setDirectory(selected);
+        setPath(selected.path);
       }
     } catch (reason) {
       setError(String(reason));
+    }
+  }
+
+  async function grant(): Promise<DirectoryGrant | undefined> {
+    if (directory && directory.path === path.trim()) return directory;
+    try {
+      const selected = await invoke<DirectoryGrant>("use_directory", { path });
+      if (directory) void invoke("revoke_directory", { rootId: directory.id });
+      setDirectory(selected);
+      setPath(selected.path);
+      setError("");
+      return selected;
+    } catch (reason) {
+      setError(String(reason));
+      return undefined;
     }
   }
 
@@ -99,14 +134,16 @@ export function NewSessionDialog({
     onOpenChange(open);
   }
 
-  function create() {
-    if (!directory) return;
-    const project = directory.path.split(/[\\/]/).filter(Boolean).pop() ?? "Session";
+  async function create() {
+    const folder = await grant();
+    if (!folder) return;
+    const project = folder.path.split(/[\\/]/).filter(Boolean).pop() ?? "Session";
     onCreate({
       id: crypto.randomUUID(),
-      agent,
-      cwd: directory.path,
-      rootId: directory.id,
+      agent: choice.agent,
+      provider: choice.provider,
+      cwd: folder.path,
+      rootId: folder.id,
       name: project,
       running: false,
     });
@@ -116,45 +153,88 @@ export function NewSessionDialog({
 
   return (
     <Dialog open={isOpen} onOpenChange={changeOpen}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>New session</DialogTitle>
           <DialogDescription>Choose an agent and the folder it should work in.</DialogDescription>
         </DialogHeader>
-        <div className="grid grid-cols-3 gap-2">
-          {agents.map((option) => (
-            <button
-              key={option.id}
-              type="button"
-              onClick={() => setAgent(option.id)}
-              className={`flex min-h-24 flex-col items-start gap-2 rounded-xl border p-3 text-left transition-colors ${agent === option.id ? "border-foreground bg-muted" : "hover:bg-muted/60"}`}
-            >
-              {option.icon}
-              <span className="text-sm font-medium">{option.label}</span>
-              <span className="text-xs leading-4 text-muted-foreground">{option.description}</span>
-            </button>
-          ))}
+        <div className="-mx-1 space-y-1">
+          {choices.map((option) => {
+            const state = availability[option.id];
+            const row = (
+              <button
+                type="button"
+                aria-pressed={option.id === choiceId}
+                onClick={() => setChoiceId(option.id)}
+                className={`flex w-full items-center gap-3 rounded-lg border px-3 py-2 text-left transition-colors ${option.id === choiceId ? "border-foreground bg-muted" : "border-transparent hover:bg-muted/60"}`}
+              >
+                <ProviderIcon agent={option.agent} provider={option.provider} className="size-5 shrink-0" />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium">{sessionLabel(option)}</span>
+                  <span className="block truncate text-xs text-muted-foreground">{option.description}</span>
+                </span>
+                {state && !state.available ? (
+                  <span className="shrink-0 text-[11px] text-muted-foreground">Not set up</span>
+                ) : null}
+              </button>
+            );
+            return (
+              <div key={option.id}>
+                {option.note ? (
+                  <Tooltip>
+                    <TooltipTrigger render={row} />
+                    <TooltipContent className="max-w-64">{option.note}</TooltipContent>
+                  </Tooltip>
+                ) : (
+                  row
+                )}
+              </div>
+            );
+          })}
         </div>
         <div className="flex gap-2">
           <Input
-            value={directory?.path ?? ""}
-            readOnly
-            placeholder="Choose a project folder"
+            value={path}
+            className="min-w-0 flex-1 font-mono text-xs"
+            placeholder="Type or choose a project folder"
             aria-label="Project folder"
+            onChange={(event) => setPath(event.target.value)}
+            onBlur={() => void grant()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void grant();
+            }}
           />
-          <Button variant="outline" onClick={chooseFolder} disabled={!directory && !error}>
-            <FolderOpen />
-            Browse
-          </Button>
+          <Tooltip>
+            <TooltipTrigger
+              render={<Button variant="outline" size="icon" onClick={chooseFolder} aria-label="Browse for a folder" />}
+            >
+              <FolderOpen />
+            </TooltipTrigger>
+            <TooltipContent>Browse</TooltipContent>
+          </Tooltip>
         </div>
         {error ? <p className="text-xs text-destructive">{error}</p> : null}
+        {status && !status.available ? <p className="text-xs text-muted-foreground">{status.detail}</p> : null}
         <DialogFooter>
           <Button variant="outline" onClick={() => changeOpen(false)}>
             Cancel
           </Button>
-          <Button disabled={!directory} onClick={create}>
-            Start session
-          </Button>
+          {status && !status.available ? (
+            <Button
+              onClick={() =>
+                void invoke("open_setup_docs", { agent: choice.agent, provider: choice.provider }).catch((reason) =>
+                  setError(String(reason)),
+                )
+              }
+            >
+              Open setup guide
+            </Button>
+          ) : (
+            <Button disabled={!path.trim() || !status} onClick={() => void create()}>
+              {status ? null : <Spinner />}
+              Start session
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

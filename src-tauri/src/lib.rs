@@ -9,7 +9,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Condvar, Mutex},
+    sync::Mutex,
     thread,
     time::Duration,
 };
@@ -22,6 +22,11 @@ const MAX_FILE_BYTES: u64 = 500_000;
 const DIRECTORY_PAGE_SIZE: usize = 250;
 const MAX_GIT_CHANGES: usize = 500;
 const CODEX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// Requests stay bounded so an app server that never answers surfaces an error instead of a stuck tab.
+const CODEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const DEEPSEEK_PROFILE: &str = "deepseek";
+const DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
+const SUPPORTED_KEYS: [&str; 4] = ["claude", "codex", "deepseek", "kimi"];
 
 struct PtySession {
     child: Box<dyn Child + Send + Sync>,
@@ -53,12 +58,6 @@ struct Roots(Mutex<HashMap<String, PathBuf>>);
 
 #[derive(Default)]
 struct ProviderSessions(Mutex<HashMap<String, String>>);
-
-#[derive(Default)]
-struct CodexDiscovery {
-    running: Mutex<bool>,
-    ready: Condvar,
-}
 
 struct CodexServer(Mutex<CodexServerState>);
 
@@ -200,6 +199,7 @@ fn is_sensitive_component(component: &std::ffi::OsStr) -> bool {
             ".docker",
             ".git-credentials",
             ".gnupg",
+            ".kimi-code",
             ".netrc",
             ".npmrc",
             ".pypirc",
@@ -224,7 +224,7 @@ fn is_sensitive_path(root: &Path, path: &Path) -> bool {
 }
 
 fn command_output(directory: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = Command::new(resolve_executable("git").unwrap_or_else(|| "git".into()))
         .arg("-C")
         .arg(path_text(directory))
         .args(args)
@@ -270,6 +270,15 @@ fn load_roots(app: &AppHandle) -> Roots {
     Roots(Mutex::new(roots))
 }
 
+// Codex threads are UUIDs and Kimi sessions are short opaque ids, so both are held to a safe file-name charset.
+fn is_provider_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+}
+
 fn load_provider_sessions(app: &AppHandle) -> ProviderSessions {
     let mut sessions = HashMap::new();
     if let Ok(entries) = provider_sessions_path(app)
@@ -284,7 +293,7 @@ fn load_provider_sessions(app: &AppHandle) -> ProviderSessions {
             }
             if let Ok(provider_session_id) = fs::read_to_string(entry.path()) {
                 let provider_session_id = provider_session_id.trim();
-                if uuid::Uuid::parse_str(provider_session_id).is_ok() {
+                if is_provider_session_id(provider_session_id) {
                     sessions.insert(session_id, provider_session_id.to_owned());
                 }
             }
@@ -350,16 +359,26 @@ fn update_provider_session(
     sessions: &ProviderSessions,
     session_id: &str,
     provider_session_id: Option<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     uuid::Uuid::parse_str(session_id).map_err(|_| "Invalid session ID")?;
     let directory = provider_sessions_path(app)?;
     let path = directory.join(session_id);
     let mut sessions = sessions.0.lock().map_err(|error| error.to_string())?;
     if let Some(provider_session_id) = provider_session_id {
+        if !is_provider_session_id(&provider_session_id) {
+            return Err("Invalid provider session ID".into());
+        }
         if let Some(existing) = sessions.get(session_id) {
             if existing == &provider_session_id {
-                return Ok(());
+                return Ok(true);
             }
+        }
+        // Claiming under the lock lets concurrent discoveries run without one stealing the other's session.
+        if sessions
+            .iter()
+            .any(|(owner, claimed)| owner != session_id && claimed == &provider_session_id)
+        {
+            return Ok(false);
         }
         write_atomic(&path, provider_session_id.as_bytes())?;
         sessions.insert(session_id.to_owned(), provider_session_id);
@@ -371,7 +390,7 @@ fn update_provider_session(
         }
         sessions.remove(session_id);
     }
-    Ok(())
+    Ok(true)
 }
 
 fn grant_directory(
@@ -413,6 +432,27 @@ fn shell_quote(value: &str) -> String {
 #[cfg(windows)]
 fn shell_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+// Claude files a session under a key derived from its working directory. Searching for the transcript
+// by name avoids depending on how that key is spelled, and a session it never wrote cannot be resumed.
+fn claude_session_exists(app: &AppHandle, session_id: &str) -> bool {
+    let Ok(home) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map_or_else(
+            || app.path().home_dir().map(|home| home.join(".claude")),
+            Ok,
+        )
+    else {
+        return false;
+    };
+    let transcript = format!("{session_id}.jsonl");
+    fs::read_dir(home.join("projects")).is_ok_and(|projects| {
+        projects
+            .flatten()
+            .any(|project| project.path().join(&transcript).is_file())
+    })
 }
 
 fn claude_settings(app: &AppHandle, session_id: &str) -> Result<PathBuf, String> {
@@ -516,6 +556,30 @@ async fn choose_directory(
     grant_directory(&app, &roots, path).map(Some)
 }
 
+// A typed path is a folder like any other: it has to exist and it goes through the same grant.
+#[tauri::command]
+async fn use_directory(
+    app: AppHandle,
+    roots: State<'_, Roots>,
+    path: String,
+) -> Result<DirectoryGrant, String> {
+    let path = path.trim();
+    let path = match path.strip_prefix('~') {
+        Some(rest) => app
+            .path()
+            .home_dir()
+            .map_err(|error| error.to_string())?
+            .join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(path),
+    };
+    if !path.is_dir() {
+        return Err("That folder does not exist".into());
+    }
+    let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    write_atomic(&last_directory_path(&app)?, path_text(&path).as_bytes())?;
+    grant_directory(&app, &roots, path)
+}
+
 #[tauri::command]
 fn revoke_directory(app: AppHandle, roots: State<Roots>, root_id: String) -> Result<(), String> {
     update_roots(&app, &roots, |roots| {
@@ -526,7 +590,7 @@ fn revoke_directory(app: AppHandle, roots: State<Roots>, root_id: String) -> Res
 fn codex_exchange<S: Read + Write, F: FnOnce(&S) -> Result<(), String>>(
     mut socket: tungstenite::WebSocket<S>,
     requests: &[(u64, &str, serde_json::Value)],
-    clear_read_timeout: F,
+    extend_read_timeout: F,
 ) -> Result<HashMap<u64, serde_json::Value>, String> {
     socket
         .send(Message::Text(
@@ -549,7 +613,7 @@ fn codex_exchange<S: Read + Write, F: FnOnce(&S) -> Result<(), String>>(
             break;
         }
     }
-    clear_read_timeout(socket.get_ref())?;
+    extend_read_timeout(socket.get_ref())?;
     socket
         .send(Message::Text(
             serde_json::json!({"method":"initialized","params":{}})
@@ -623,7 +687,7 @@ fn codex_requests_once(
             tungstenite::client("ws://localhost/", stream).map_err(|error| error.to_string())?;
         codex_exchange(socket, requests, |stream| {
             stream
-                .set_read_timeout(None)
+                .set_read_timeout(Some(CODEX_REQUEST_TIMEOUT))
                 .map_err(|error| error.to_string())
         })
     }
@@ -632,6 +696,12 @@ fn codex_requests_once(
         let (socket, _) = tungstenite::connect(endpoint).map_err(|error| error.to_string())?;
         codex_exchange(socket, requests, |_| Ok(()))
     }
+}
+
+fn codex_executable() -> Result<PathBuf, String> {
+    resolve_executable("codex").ok_or_else(|| {
+        "Could not find the Codex CLI in your PATH. Install it, then reopen this tab.".to_owned()
+    })
 }
 
 fn ensure_codex_server(server: &CodexServer) -> Result<(), String> {
@@ -656,7 +726,7 @@ fn ensure_codex_server(server: &CodexServer) -> Result<(), String> {
 
     #[cfg(windows)]
     {
-        let mut login = Command::new("codex");
+        let mut login = Command::new(codex_executable()?);
         login.args(["login", "status"]);
         if let Some(path) = user_path() {
             login.env("PATH", path);
@@ -676,7 +746,7 @@ fn ensure_codex_server(server: &CodexServer) -> Result<(), String> {
         );
         drop(listener);
     }
-    let mut command = Command::new("codex");
+    let mut command = Command::new(codex_executable()?);
     #[cfg(unix)]
     command.args(["app-server", "--listen", "unix://"]);
     #[cfg(windows)]
@@ -830,28 +900,6 @@ fn codex_thread_resumable(server: &CodexServer, thread_id: &str) -> Result<bool,
     })
 }
 
-fn begin_codex_discovery(discovery: &CodexDiscovery) -> Result<(), String> {
-    let mut running = discovery
-        .running
-        .lock()
-        .map_err(|error| error.to_string())?;
-    while *running {
-        running = discovery
-            .ready
-            .wait(running)
-            .map_err(|error| error.to_string())?;
-    }
-    *running = true;
-    Ok(())
-}
-
-fn finish_codex_discovery(discovery: &CodexDiscovery) {
-    if let Ok(mut running) = discovery.running.lock() {
-        *running = false;
-        discovery.ready.notify_one();
-    }
-}
-
 fn stop_codex_server(server: &CodexServer) {
     let Ok(mut server) = server.0.lock() else {
         return;
@@ -898,8 +946,279 @@ fn user_path() -> Option<String> {
     std::env::var("PATH").ok()
 }
 
+// Keys live in one owner-only file beside Lite's other local state, which is what the Codex and Kimi
+// CLIs already do with their own credentials, and it survives updates because the updater replaces the
+// bundle and not the data directory. A key is handed to a session through the environment variable its
+// CLI already reads, so nothing is copied into provider configuration.
+fn api_keys_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("api-keys.json"))
+}
+
+fn api_key_env(agent: &str, provider: Option<&str>) -> Option<(&'static str, &'static str)> {
+    match (agent, provider) {
+        ("claude", _) => Some(("claude", "ANTHROPIC_API_KEY")),
+        ("codex", Some("deepseek")) => Some(("deepseek", "DEEPSEEK_API_KEY")),
+        ("codex", _) => Some(("codex", "OPENAI_API_KEY")),
+        ("kimi", _) => Some(("kimi", "MOONSHOT_API_KEY")),
+        _ => None,
+    }
+}
+
+fn saved_api_key(app: &AppHandle, agent: &str, provider: Option<&str>) -> Option<String> {
+    let (name, _) = api_key_env(agent, provider)?;
+    load_api_keys(app).remove(name)
+}
+
+fn load_api_keys(app: &AppHandle) -> HashMap<String, String> {
+    api_keys_path(app)
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn write_api_keys(app: &AppHandle, keys: &HashMap<String, String>) -> Result<(), String> {
+    let path = api_keys_path(app)?;
+    write_atomic(
+        &path,
+        &serde_json::to_vec(keys).map_err(|error| error.to_string())?,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+// macOS keeps Claude Code's credentials in the login keychain; other platforms write a file. Presence is
+// all that is read here, never the credential itself.
+fn claude_signed_in(app: &AppHandle) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        Command::new("security")
+            .args(["find-generic-password", "-s", "Claude Code-credentials"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        app.path()
+            .home_dir()
+            .is_ok_and(|home| home.join(".claude").join(".credentials.json").is_file())
+    }
+}
+
+fn cli_signed_in(app: &AppHandle, name: &str) -> bool {
+    match name {
+        "claude" => claude_signed_in(app),
+        "codex" => codex_home(app).is_ok_and(|home| home.join("auth.json").is_file()),
+        "deepseek" => deepseek_profile_exists(app) || codex_declares_deepseek(app),
+        "kimi" => kimi_home(app).is_ok_and(|home| home.join("config.toml").is_file()),
+        _ => false,
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderAuth {
+    name: String,
+    key_hint: Option<String>,
+    cli_signed_in: bool,
+}
+
+#[tauri::command]
+async fn provider_auth(app: AppHandle) -> Result<Vec<ProviderAuth>, String> {
+    let keys = load_api_keys(&app);
+    Ok(SUPPORTED_KEYS
+        .iter()
+        .map(|name| ProviderAuth {
+            name: (*name).to_owned(),
+            // Only the last characters travel to the interface, enough to tell two keys apart.
+            key_hint: keys.get(*name).map(|key| {
+                key.chars()
+                    .skip(key.chars().count().saturating_sub(4))
+                    .collect()
+            }),
+            cli_signed_in: cli_signed_in(&app, name),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn save_api_key(app: AppHandle, name: String, key: String) -> Result<(), String> {
+    let key = key.trim().to_owned();
+    if key.is_empty() {
+        return Err("Enter an API key".into());
+    }
+    if !SUPPORTED_KEYS.contains(&name.as_str()) {
+        return Err("Unknown provider".into());
+    }
+    let mut keys = load_api_keys(&app);
+    keys.insert(name, key);
+    write_api_keys(&app, &keys)
+}
+
+#[tauri::command]
+async fn delete_api_key(app: AppHandle, name: String) -> Result<(), String> {
+    let mut keys = load_api_keys(&app);
+    if keys.remove(&name).is_none() {
+        return Ok(());
+    }
+    write_api_keys(&app, &keys)
+}
+
+// A launched app inherits a bare PATH, and the PATH given to a child is not used to find the program
+// itself, so anything Lite runs has to be located in the user's own PATH first and run by full path.
+fn resolve_executable(name: &str) -> Option<PathBuf> {
+    let path = user_path()?;
+    std::env::split_paths(&path).find_map(|directory| {
+        #[cfg(windows)]
+        {
+            ["exe", "cmd", "bat"]
+                .iter()
+                .map(|extension| directory.join(format!("{name}.{extension}")))
+                .find(|candidate| candidate.is_file())
+        }
+        #[cfg(unix)]
+        {
+            let candidate = directory.join(name);
+            candidate.is_file().then_some(candidate)
+        }
+    })
+}
+
+fn executable_exists(name: &str) -> bool {
+    resolve_executable(name).is_some()
+}
+
+fn codex_home(app: &AppHandle) -> Result<PathBuf, String> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map_or_else(
+            || {
+                app.path()
+                    .home_dir()
+                    .map(|home| home.join(".codex"))
+                    .map_err(|error| error.to_string())
+            },
+            Ok,
+        )
+}
+
+// Looks only for the section header. The DeepSeek credential lives in that file and is never read.
+fn codex_declares_deepseek(app: &AppHandle) -> bool {
+    let Ok(home) = codex_home(app) else {
+        return false;
+    };
+    let Ok(file) = fs::File::open(home.join("config.toml")) else {
+        return false;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| line.trim() == "[model_providers.deepseek]")
+}
+
+fn deepseek_profile_exists(app: &AppHandle) -> bool {
+    codex_home(app).is_ok_and(|home| {
+        home.join(format!("{DEEPSEEK_PROFILE}.config.toml"))
+            .is_file()
+    })
+}
+
+fn kimi_home(app: &AppHandle) -> Result<PathBuf, String> {
+    std::env::var_os("KIMI_CODE_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map_or_else(
+            || {
+                app.path()
+                    .home_dir()
+                    .map(|home| home.join(".kimi-code"))
+                    .map_err(|error| error.to_string())
+            },
+            Ok,
+        )
+}
+
+// Kimi groups sessions under an opaque per-directory key that its workspace index maps back to a path.
+fn kimi_workspace_key(app: &AppHandle, cwd: &Path) -> Option<String> {
+    let bytes = fs::read(kimi_home(app).ok()?.join("workspaces.json")).ok()?;
+    let index: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    index
+        .get("workspaces")?
+        .as_object()?
+        .iter()
+        .find(|(key, workspace)| {
+            is_provider_session_id(key)
+                && workspace
+                    .get("root")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|root| fs::canonicalize(root).ok())
+                    .is_some_and(|root| root == cwd)
+        })
+        .map(|(key, _)| key.clone())
+}
+
+// Launching Kimi without an id attaches to whatever session the directory already has rather than making
+// one, so the session a tab is showing is that directory's most recent, and a tab records it by claiming
+// it. A second tab there attaches to the same session until `/new` gives it one of its own to claim.
+fn kimi_current_session(app: &AppHandle, cwd: &Path) -> Option<String> {
+    let key = kimi_workspace_key(app, cwd)?;
+    let home = kimi_home(app).ok()?;
+    fs::read_dir(home.join("sessions").join(key))
+        .ok()?
+        .flatten()
+        .filter_map(|session| {
+            let name = session.file_name().to_str()?.to_owned();
+            if !session.file_type().ok()?.is_dir() || !is_provider_session_id(&name) {
+                return None;
+            }
+            Some((session.metadata().ok()?.modified().ok()?, name))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, name)| name)
+}
+
+// Only this directory's group is read, so a Kimi session started elsewhere is never claimed by this tab.
+fn kimi_session_ids(app: &AppHandle, cwd: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Some(key) = kimi_workspace_key(app, cwd) else {
+        return ids;
+    };
+    let Ok(home) = kimi_home(app) else {
+        return ids;
+    };
+    let Ok(sessions) = fs::read_dir(home.join("sessions").join(key)) else {
+        return ids;
+    };
+    for session in sessions.flatten() {
+        if !session.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if let Some(name) = session.file_name().to_str()
+            && is_provider_session_id(name)
+        {
+            ids.insert(name.to_owned());
+        }
+    }
+    ids
+}
+
 fn agent_command(
+    app: &AppHandle,
     agent: &str,
+    provider: Option<&str>,
     resume: bool,
     session_id: &str,
     provider_session_id: Option<&str>,
@@ -917,8 +1236,40 @@ fn agent_command(
         }
         "codex" => {
             let mut command = CommandBuilder::new("codex");
+            // DeepSeek is selected per launch so the default Codex provider stays whatever the user set.
+            if provider == Some("deepseek") {
+                if saved_api_key(app, agent, provider).is_some() {
+                    // A key held by Lite defines the provider inline and is read from the environment,
+                    // so no Codex configuration file has to exist or be written.
+                    for override_value in [
+                        "model_providers.deepseek.name=\"deepseek\"",
+                        "model_providers.deepseek.base_url=\"https://api.deepseek.com/\"",
+                        "model_providers.deepseek.wire_api=\"responses\"",
+                        "model_providers.deepseek.env_key=\"DEEPSEEK_API_KEY\"",
+                    ] {
+                        command.args(["-c", override_value]);
+                    }
+                    command.args(["-c", "model_provider=\"deepseek\""]);
+                    command.args(["-c", &format!("model=\"{DEEPSEEK_MODEL}\"")]);
+                } else if deepseek_profile_exists(app) {
+                    command.args(["--profile", DEEPSEEK_PROFILE]);
+                } else {
+                    command.args(["-c", "model_provider=\"deepseek\""]);
+                    command.args(["-c", &format!("model=\"{DEEPSEEK_MODEL}\"")]);
+                }
+            }
             if let Some(provider_session_id) = provider_session_id {
                 command.args(["resume", provider_session_id]);
+            }
+            command
+        }
+        "kimi" => {
+            // Only an exact id resumes. `--continue` would reopen whatever ran last in the directory,
+            // which two tabs there would both land on, and it creates no entry for discovery to record,
+            // so the tab could never learn which session it is showing.
+            let mut command = CommandBuilder::new("kimi");
+            if let Some(provider_session_id) = provider_session_id {
+                command.args(["--session", provider_session_id]);
             }
             command
         }
@@ -928,7 +1279,150 @@ fn agent_command(
     if let Some(path) = user_path() {
         command.env("PATH", path);
     }
+    // The key reaches the CLI through the variable it already reads, and only for this session.
+    if let Some((_, variable)) = api_key_env(agent, provider)
+        && let Some(key) = saved_api_key(app, agent, provider)
+    {
+        command.env(variable, key);
+    }
     Ok(command)
+}
+
+// Each CLI owns its sign-in and opens the browser itself, so Lite only runs the command and shows it.
+fn login_command(agent: &str) -> Result<CommandBuilder, String> {
+    let mut command = match agent {
+        "claude" => {
+            let mut command = CommandBuilder::new("claude");
+            command.args(["auth", "login"]);
+            command
+        }
+        "codex" => {
+            let mut command = CommandBuilder::new("codex");
+            command.arg("login");
+            command
+        }
+        "kimi" => {
+            let mut command = CommandBuilder::new("kimi");
+            command.arg("login");
+            command
+        }
+        _ => return Err("This provider signs in with an API key".into()),
+    };
+    if let Some(path) = user_path() {
+        command.env("PATH", path);
+    }
+    Ok(command)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Availability {
+    available: bool,
+    detail: String,
+}
+
+#[tauri::command]
+async fn agent_availability(
+    app: AppHandle,
+    agent: String,
+    provider: Option<String>,
+) -> Result<Availability, String> {
+    let (executable, missing) = match agent.as_str() {
+        "claude" => (
+            "claude",
+            "Install the Claude Code CLI, then sign in with `claude`.",
+        ),
+        "codex" => (
+            "codex",
+            "Install the Codex CLI, then sign in with `codex login`.",
+        ),
+        "kimi" => (
+            "kimi",
+            if cfg!(windows) {
+                "Install Git for Windows, then run `irm https://code.kimi.com/kimi-code/install.ps1 | iex` in PowerShell."
+            } else {
+                "Install Kimi Code with `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash`."
+            },
+        ),
+        "shell" => {
+            return Ok(Availability {
+                available: true,
+                detail: String::new(),
+            });
+        }
+        _ => return Err("Unknown session type".into()),
+    };
+    if !executable_exists(executable) {
+        return Ok(Availability {
+            available: false,
+            detail: missing.into(),
+        });
+    }
+    if agent == "codex" && provider.as_deref() == Some("deepseek") {
+        let configured = saved_api_key(&app, &agent, provider.as_deref()).is_some()
+            || deepseek_profile_exists(&app)
+            || codex_declares_deepseek(&app);
+        return Ok(Availability {
+            available: configured,
+            detail: if configured {
+                String::new()
+            } else {
+                format!(
+                    "Save a DeepSeek key in Lite's settings, or add a DeepSeek provider to your Codex configuration. Either way Lite launches `{DEEPSEEK_MODEL}` through it."
+                )
+            },
+        });
+    }
+    Ok(Availability {
+        available: true,
+        detail: String::new(),
+    })
+}
+
+#[tauri::command]
+async fn open_setup_docs(agent: String, provider: Option<String>) -> Result<(), String> {
+    let url = match (agent.as_str(), provider.as_deref()) {
+        ("claude", _) => "https://code.claude.com/docs/en/setup",
+        ("codex", Some("deepseek")) => {
+            "https://api-docs.deepseek.com/quick_start/agent_integrations/codex"
+        }
+        ("codex", _) => "https://developers.openai.com/codex/cli",
+        ("kimi", _) => {
+            "https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html"
+        }
+        _ => return Err("No setup guide for this session type".into()),
+    };
+    open_external(url)
+}
+
+// Terminals make their links clickable, and a provider's sign-in URL is the reason people want that.
+// Only web schemes open, so terminal output cannot talk the browser into anything else.
+#[tauri::command]
+async fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("Only web links can be opened".into());
+    }
+    open_external(&url)
+}
+
+fn open_external(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/c", "start", ""]);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open the link: {error}"))
 }
 
 #[tauri::command]
@@ -938,19 +1432,25 @@ async fn spawn_session(
     roots: State<'_, Roots>,
     provider_sessions: State<'_, ProviderSessions>,
     codex_server: State<'_, CodexServer>,
-    codex_discovery: State<'_, CodexDiscovery>,
     session_id: String,
     run_id: String,
     root_id: String,
     mut provider_session_id: Option<String>,
     agent: String,
+    provider: Option<String>,
+    mode: Option<String>,
+    theme: Option<String>,
     name: String,
     resume: bool,
     cols: u16,
     rows: u16,
 ) -> Result<Option<String>, String> {
     let cwd = root_path(&roots, &root_id)?;
-    if agent == "codex" {
+    // A sign-in runs the provider's own login command and owns no session of its own.
+    let signing_in = mode.as_deref() == Some("login");
+    // Resuming a Claude session it never recorded fails outright, so that tab starts one instead.
+    let resume = resume && (agent != "claude" || claude_session_exists(&app, &session_id));
+    if !signing_in && (agent == "codex" || agent == "kimi") {
         if let Some(saved_provider_session_id) = provider_sessions
             .0
             .lock()
@@ -960,6 +1460,15 @@ async fn spawn_session(
         {
             provider_session_id = Some(saved_provider_session_id);
         }
+    }
+    // An id the tab already holds is recorded here too, so no other tab claims that same session.
+    if let Some(known) = provider_session_id.as_deref() {
+        let _ = update_provider_session(
+            &app,
+            &provider_sessions,
+            &session_id,
+            Some(known.to_owned()),
+        );
     }
     let stale = {
         let mut running = sessions.0.lock().map_err(|error| error.to_string())?;
@@ -989,7 +1498,8 @@ async fn spawn_session(
             pixel_height: 0,
         })
         .map_err(|error| error.to_string())?;
-    if agent == "codex"
+    if !signing_in
+        && agent == "codex"
         && provider_session_id.is_some()
         && !codex_thread_resumable(
             &codex_server,
@@ -999,37 +1509,59 @@ async fn spawn_session(
         update_provider_session(&app, &provider_sessions, &session_id, None)?;
         provider_session_id = None;
     }
-    let mut command = agent_command(
-        &agent,
-        resume,
-        &session_id,
-        provider_session_id.as_deref(),
-        &name,
-    )?;
-    if agent == "claude" {
+    // A Kimi session the user deleted should start a new one instead of failing the terminal.
+    if !signing_in
+        && agent == "kimi"
+        && let Some(known) = provider_session_id.as_deref()
+        && !kimi_session_ids(&app, &cwd).contains(known)
+    {
+        update_provider_session(&app, &provider_sessions, &session_id, None)?;
+        provider_session_id = None;
+    }
+    let mut command = if signing_in {
+        login_command(&agent)?
+    } else {
+        agent_command(
+            &app,
+            &agent,
+            provider.as_deref(),
+            resume,
+            &session_id,
+            provider_session_id.as_deref(),
+            &name,
+        )?
+    };
+    if !signing_in && agent == "claude" {
         let settings = claude_settings(&app, &session_id)?;
         command.args(["--settings", &path_text(&settings)]);
     }
     command.cwd(path_text(&cwd));
     command.env("TERM", "xterm-256color");
-    let codex_threads = if agent == "codex" && provider_session_id.is_none() {
-        begin_codex_discovery(&codex_discovery)?;
-        match codex_thread_ids(&codex_server, &cwd) {
-            Ok(threads) => Some(threads),
-            Err(error) => {
-                finish_codex_discovery(&codex_discovery);
-                return Err(error);
+    // The conventional hint for which way a terminal is shaded, so a CLI picks a readable palette.
+    command.env(
+        "COLORFGBG",
+        if theme.as_deref() == Some("light") {
+            "0;15"
+        } else {
+            "15;0"
+        },
+    );
+    // Codex records a new thread per launch, so its discovery watches for one the tab did not start with.
+    // Kimi attaches to the directory's session instead, so its discovery reads that session directly.
+    let known_sessions =
+        if !signing_in && provider_session_id.is_none() && (agent == "codex" || agent == "kimi") {
+            if agent == "kimi" {
+                Some(HashSet::new())
+            } else {
+                // Losing discovery costs exact resume, not the session, so a failure still opens the terminal.
+                codex_thread_ids(&codex_server, &cwd).ok()
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let mut child = match pair.slave.spawn_command(command) {
         Ok(child) => child,
         Err(error) => {
-            if codex_threads.is_some() {
-                finish_codex_discovery(&codex_discovery);
-            }
             return Err(if agent == "shell" {
                 error.to_string()
             } else {
@@ -1045,9 +1577,6 @@ async fn spawn_session(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            if codex_threads.is_some() {
-                finish_codex_discovery(&codex_discovery);
-            }
             return Err(error.to_string());
         }
     };
@@ -1056,9 +1585,6 @@ async fn spawn_session(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            if codex_threads.is_some() {
-                finish_codex_discovery(&codex_discovery);
-            }
             return Err(error.to_string());
         }
     };
@@ -1067,9 +1593,6 @@ async fn spawn_session(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            if codex_threads.is_some() {
-                finish_codex_discovery(&codex_discovery);
-            }
             return Err(error.to_string());
         }
     };
@@ -1134,20 +1657,31 @@ async fn spawn_session(
         );
     });
 
-    if let Some(existing) = codex_threads {
+    if let Some(existing) = known_sessions {
         let discovery_app = app.clone();
         let discovery_session_id = session_id.clone();
+        let discovery_agent = agent.clone();
         thread::spawn(move || {
             loop {
-                if let Ok(current) = codex_thread_ids(&discovery_app.state::<CodexServer>(), &cwd)
-                    && let Some(provider_session_id) = current.difference(&existing).next()
-                    && update_provider_session(
-                        &discovery_app,
-                        &discovery_app.state::<ProviderSessions>(),
-                        &discovery_session_id,
-                        Some(provider_session_id.clone()),
-                    )
-                    .is_ok()
+                let candidates = if discovery_agent == "kimi" {
+                    Ok(kimi_current_session(&discovery_app, &cwd)
+                        .into_iter()
+                        .collect::<HashSet<_>>())
+                } else {
+                    codex_thread_ids(&discovery_app.state::<CodexServer>(), &cwd)
+                        .map(|current| current.difference(&existing).cloned().collect())
+                };
+                // Whatever another tab already claimed is skipped, so overlapping launches settle apart.
+                if let Ok(candidates) = candidates
+                    && candidates.iter().any(|provider_session_id| {
+                        update_provider_session(
+                            &discovery_app,
+                            &discovery_app.state::<ProviderSessions>(),
+                            &discovery_session_id,
+                            Some(provider_session_id.clone()),
+                        )
+                        .unwrap_or(false)
+                    })
                 {
                     break;
                 }
@@ -1161,7 +1695,6 @@ async fn spawn_session(
                 }
                 thread::sleep(Duration::from_secs(1));
             }
-            finish_codex_discovery(&discovery_app.state::<CodexDiscovery>());
         });
     }
 
@@ -1239,7 +1772,7 @@ fn delete_session_data(
             Err(error) => return Err(error.to_string()),
         }
     }
-    update_provider_session(&app, &provider_sessions, &session_id, None)
+    update_provider_session(&app, &provider_sessions, &session_id, None).map(|_| ())
 }
 
 #[tauri::command]
@@ -1328,7 +1861,7 @@ async fn git_status(roots: State<'_, Roots>, root_id: String) -> Result<Option<G
         Err(_) => return Ok(None),
     };
     let branch = command_output(&path, &["branch", "--show-current"])?;
-    let mut child = Command::new("git")
+    let mut child = Command::new(resolve_executable("git").unwrap_or_else(|| "git".into()))
         .arg("-C")
         .arg(path_text(&path))
         .args(["status", "--short"])
@@ -1368,8 +1901,13 @@ async fn read_usage(
     app: AppHandle,
     codex_server: State<'_, CodexServer>,
     agent: String,
+    provider: Option<String>,
     session_id: String,
 ) -> Result<Option<UsageSnapshot>, String> {
+    // A DeepSeek-backed Codex session bills DeepSeek, so the OpenAI account limits are not its usage.
+    if agent == "codex" && provider.as_deref() == Some("deepseek") {
+        return Ok(None);
+    }
     match agent.as_str() {
         "claude" => {
             let path = app
@@ -1386,7 +1924,7 @@ async fn read_usage(
             }
         }
         "codex" => codex_usage(&codex_server).map(Some),
-        "shell" => Ok(None),
+        "kimi" | "shell" => Ok(None),
         _ => Err("Unknown session type".into()),
     }
 }
@@ -1448,7 +1986,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Sessions::default())
-        .manage(CodexDiscovery::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(load_roots(app.handle()));
@@ -1458,6 +1995,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_directory,
+            use_directory,
             default_directory,
             revoke_directory,
             spawn_session,
@@ -1469,6 +2007,12 @@ pub fn run() {
             read_text_file,
             git_status,
             read_usage,
+            agent_availability,
+            open_setup_docs,
+            open_url,
+            provider_auth,
+            save_api_key,
+            delete_api_key,
             check_update,
             install_update
         ])

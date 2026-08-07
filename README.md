@@ -1,4 +1,6 @@
-<a href="https://www.ultralytics.com/"><img src="https://raw.githubusercontent.com/ultralytics/assets/main/logo/Ultralytics_Logotype_Original.svg" width="320" alt="Ultralytics logo"></a>
+<a href="https://www.ultralytics.com"><img src="https://raw.githubusercontent.com/ultralytics/assets/main/logo/Ultralytics_Logotype_Original.svg" width="320" alt="Ultralytics logo"></a>
+
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 # ⚡ Ultralytics Lite
 
@@ -6,28 +8,30 @@
 [![CI](https://github.com/ultralytics/lite/actions/workflows/ci.yml/badge.svg)](https://github.com/ultralytics/lite/actions/workflows/ci.yml)
 
 [![Ultralytics Discord](https://img.shields.io/discord/1089800235347353640?logo=discord&logoColor=white&label=Discord&color=blue)](https://discord.com/invite/ultralytics)
-[![Ultralytics Forums](https://img.shields.io/discourse/users?server=https%3A%2F%2Fcommunity.ultralytics.com&logo=discourse&label=Forums&color=blue)](https://community.ultralytics.com/)
+[![Ultralytics Forums](https://img.shields.io/discourse/users?server=https%3A%2F%2Fcommunity.ultralytics.com&logo=discourse&label=Forums&color=blue)](https://community.ultralytics.com)
 [![Ultralytics Reddit](https://img.shields.io/reddit/subreddit-subscribers/ultralytics?style=flat&logo=reddit&logoColor=white&label=Reddit&color=blue)](https://reddit.com/r/ultralytics)
 
-Lite is a fast, local workspace for [Claude Code](https://code.claude.com/docs/en/overview), [Codex](https://developers.openai.com/codex/cli), and your shell. Keep agent sessions, files, and Git context together without repository indexing, telemetry, or a cloud service.
+Lite is a fast, local workspace for [Claude Code](https://code.claude.com/docs/en/overview), [Codex](https://developers.openai.com/codex/cli) on OpenAI or [DeepSeek](https://api-docs.deepseek.com/quick_start/agent_integrations/codex), [Kimi Code](https://www.kimi.com/code), and your shell. Keep agent sessions, files, and Git context together without repository indexing, telemetry, or a cloud service.
 
 <div align="center">
   <br>
-  <a href="https://github.com/ultralytics/lite/releases/latest"><img src="https://github.com/ultralytics/lite/blob/eeb99328e396cbb55508a7d34fce96f6cf0e86f1/lite-product-full.png?raw=true" width="100%" alt="Ultralytics Lite desktop app"></a>
+  <a href="https://github.com/ultralytics/lite/releases/latest"><img src="https://github.com/user-attachments/assets/b4664fe2-fd5b-450f-92e1-bdc83cdab468" width="100%" alt="Ultralytics Lite desktop app"></a>
   <br>
 </div>
 
 ## ✨ Features
 
-- Run Claude Code, Codex, and shell sessions side by side
-- Resume session tabs after closing Lite or restarting your computer
+- Run Claude Code, Codex, Kimi Code, and shell sessions side by side
+- Run Codex against DeepSeek when your Codex configuration provides that model
+- Resume session tabs automatically after closing Lite or restarting your computer
 - Authenticate once with each provider and reuse its existing local credentials
+- Or save an API key per provider in Lite and skip the sign-in flows entirely
 - Browse files on demand with syntax highlighting for popular languages
 - Preview rendered Markdown safely alongside source files
 - See the active Git branch, worktree, and changed files
 - Inspect per-session context and provider usage reported by Claude or Codex
 - Install signed updates from inside Lite
-- Switch between light and dark themes
+- Switch between light and dark themes, terminal and code preview included
 
 Lite is intentionally quiet: idle means idle. It does not index your repository, watch every file, read provider tokens, or send telemetry.
 
@@ -37,27 +41,31 @@ Download Lite from the [latest GitHub Release](https://github.com/ultralytics/li
 
 ### macOS
 
-1. Download `Lite_0.0.2_darwin_aarch64.dmg` for an Apple silicon Mac.
+1. Download `Lite_0.0.4_darwin_aarch64.dmg` for an Apple silicon Mac.
 2. Open the disk image and drag **Lite** into **Applications**.
-3. Open Lite from **Applications**. If macOS blocks this first unsigned release, open **System Settings → Privacy & Security**, select **Open Anyway** for Lite, then confirm.
+3. Open Lite from **Applications**. If macOS blocks this first unsigned release, open **System Settings → Privacy & Security**, set **Allow applications from** to **App Store & Known Developers**, select **Open Anyway** for Lite, then confirm.
+
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/a7d3a991-91f2-4d9b-ba57-a8d80bbc37f5" width="70%" alt="Approving Lite in macOS System Settings">
+</div>
 
 ### Windows
 
-1. Download `Lite_0.0.2_windows_x64-setup.exe`.
+1. Download `Lite_0.0.4_windows_x64-setup.exe`.
 2. Run the installer, then open **Lite** from the Start menu.
 3. If Microsoft Defender SmartScreen appears for this early unsigned release, select **More info → Run anyway**.
 
 ### Linux
 
-Download the portable `Lite_0.0.2_linux_amd64.AppImage`.
+Download the portable `Lite_0.0.4_linux_amd64.AppImage`.
 
 ```bash
 # AppImage
-chmod +x Lite_0.0.2_linux_amd64.AppImage
-./Lite_0.0.2_linux_amd64.AppImage
+chmod +x Lite_0.0.4_linux_amd64.AppImage
+./Lite_0.0.4_linux_amd64.AppImage
 ```
 
-After installing 0.0.2, use the update button beside the theme switch to check for signed updates, install them, and restart Lite. Lite never checks for updates in the background.
+After installing 0.0.4, open the Lite menu in the top bar and choose **Check for updates** to install signed updates and restart Lite. Lite never checks for updates in the background.
 
 ## 🚀 First Run
 
@@ -65,8 +73,30 @@ Install the provider CLIs you want to use:
 
 - [Claude Code](https://code.claude.com/docs/en/setup)
 - [Codex](https://developers.openai.com/codex/cli)
+- [Kimi Code](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html) — Windows also needs Git for Windows
 
-Open each provider in Lite and complete its normal sign-in once. Claude Code and Codex keep credentials in their standard local stores, so every later Lite session reuses the same authentication. Lite never copies or stores those tokens.
+Open each provider in Lite and complete its normal sign-in once. Every CLI keeps credentials in its own local store, so later Lite sessions reuse the same authentication. Lite never reads or copies those stores. The new-session dialog tells you when a CLI is missing and links to its setup guide.
+
+If you would rather use API keys, open **API keys** in the Lite menu and paste one per provider. Lite keeps them in an owner-only file in its own data folder — the same shape Codex and Kimi already use for their credentials — and passes a key to a session through the environment variable that CLI already reads (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`). Nothing is written into provider configuration, deleting a key takes effect on the next launch, and app updates keep the file since the updater replaces the bundle and not your data.
+
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/2955ffef-6003-43d1-a5c0-51c58e2612c9" width="100%" alt="Saving provider API keys in Lite">
+</div>
+
+**Codex · DeepSeek** runs the Codex harness against DeepSeek instead of OpenAI. Saving a DeepSeek key in Lite is enough — Lite then defines the provider for that launch only. To configure it yourself instead, use your own [Codex configuration](https://api-docs.deepseek.com/quick_start/agent_integrations/codex); a `deepseek.config.toml` profile in `$CODEX_HOME` is cleanest:
+
+```toml
+model = "deepseek-v4-flash"
+model_provider = "deepseek"
+
+[model_providers.deepseek]
+name = "deepseek"
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+experimental_bearer_token = "<your DeepSeek API key>"
+```
+
+Leave `preferred_auth_method` and `forced_login_method` out. Codex applies those globally, and setting them signs you out of ChatGPT the next time it runs. Lite selects the DeepSeek provider per launch, so your default Codex provider and existing OpenAI sessions are untouched, and it never reads or stores the DeepSeek key.
 
 Choose a project folder, create a session, and work. Lite saves only the local metadata needed to restore tabs; provider conversation history remains owned by the provider CLI.
 

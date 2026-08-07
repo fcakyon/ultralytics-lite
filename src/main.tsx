@@ -2,12 +2,15 @@
 
 import React from "react";
 import ReactDOM from "react-dom/client";
-import App, { initialTheme } from "./App";
+import App from "./App";
+import { applyTheme, initialTheme } from "./theme";
 import "./index.css";
 
-const theme = initialTheme();
-document.documentElement.classList.toggle("dark", theme === "dark");
-document.documentElement.style.colorScheme = theme;
+applyTheme(initialTheme());
+
+// macOS draws its window buttons over the top bar, so the bar reserves room for them there and nowhere
+// else. Fullscreen takes the buttons away, and App clears this when it does.
+if (navigator.userAgent.includes("Macintosh")) document.documentElement.dataset.titlebar = "overlay";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
