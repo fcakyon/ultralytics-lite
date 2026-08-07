@@ -20,6 +20,7 @@ import {
 import { Component, lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { LiteLogomark, ProviderIcon } from "@/brand-icons";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -54,7 +55,23 @@ import "./App.css";
 
 const STORAGE_KEY = "lite.sessions.v1";
 const TerminalView = lazy(() => import("@/terminal").then((module) => ({ default: module.TerminalView })));
-type UpdateStatus = "checking" | "available" | "current" | "installing" | "error";
+// The version is known from the start, so the badge shows it throughout and only its color waits on
+// the answer: grey while asking, which is quieter than a spinner that would resize a chip this small.
+const BADGE_VARIANT = {
+  checking: "secondary",
+  current: "success",
+  behind: "warning",
+  unknown: "outline",
+} as const;
+
+const RELEASE_NOTE = {
+  checking: "",
+  current: " · up to date",
+  behind: " · an update is available",
+  unknown: "",
+} as const;
+
+type UpdateStatus = "checking" | "available" | "rebuild" | "current" | "installing" | "error";
 
 function loadSessions(): Session[] {
   try {
@@ -135,7 +152,7 @@ function SessionRow({
             <Input
               autoFocus
               value={name}
-              className="h-6 px-1.5 text-xs"
+              className="px-1.5"
               aria-label="Session name"
               onChange={(event) => setName(event.target.value)}
               onBlur={saveName}
@@ -253,6 +270,10 @@ function App() {
   const [startingIds, setStartingIds] = useState<Set<string>>(new Set());
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [version, setVersion] = useState("");
+  // Undefined until asked: an empty string is a release, anything else is the commit it was built from.
+  const [commit, setCommit] = useState<string>();
+  const [built, setBuilt] = useState("");
+  const [release, setRelease] = useState<"checking" | "current" | "behind" | "unknown">("checking");
   const [updateOpen, setUpdateOpen] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("checking");
   const [availableVersion, setAvailableVersion] = useState("");
@@ -320,7 +341,38 @@ function App() {
     void getVersion()
       .then(setVersion)
       .catch(() => setVersion(""));
+    void invoke<string | null>("build_date")
+      .then((value) => setBuilt(value ?? ""))
+      .catch(() => setBuilt(""));
+    void invoke<string | null>("local_commit")
+      .then((value) => setCommit(value ?? ""))
+      .catch(() => setCommit(""));
   }, []);
+
+  // Only a release can be behind a release. Asking costs a network round trip that is never worth
+  // delaying a paint or a restored session for, so it waits for the window to go idle and is dropped
+  // if the window goes away first.
+  useEffect(() => {
+    if (commit !== "") return;
+    let cancelled = false;
+    const check = () => {
+      if (cancelled) return;
+      void invoke<string | null>("check_update")
+        .then((next) => {
+          if (!cancelled) setRelease(next ? "behind" : "current");
+        })
+        .catch(() => {
+          if (!cancelled) setRelease("unknown");
+        });
+    };
+    const idle = typeof window.requestIdleCallback === "function";
+    const handle = idle ? window.requestIdleCallback(check, { timeout: 10000 }) : window.setTimeout(check, 3000);
+    return () => {
+      cancelled = true;
+      if (idle) window.cancelIdleCallback(handle);
+      else window.clearTimeout(handle);
+    };
+  }, [commit]);
 
   useEffect(() => {
     let disposed = false;
@@ -480,9 +532,10 @@ function App() {
     setUpdateStatus("checking");
     setUpdateError("");
     try {
-      const next = await invoke<string | null>("check_update");
+      // A release would replace this build rather than update it, so a local build asks its own tree.
+      const next = await invoke<string | null>(commit ? "local_update" : "check_update");
       setAvailableVersion(next ?? "");
-      setUpdateStatus(next ? "available" : "current");
+      setUpdateStatus(next ? (commit ? "rebuild" : "available") : "current");
     } catch (reason) {
       setUpdateError(String(reason));
       setUpdateStatus("error");
@@ -511,9 +564,48 @@ function App() {
         {/* The window buttons sit inside this bar on macOS, so it doubles as the title bar and drags the window. */}
         <header
           data-tauri-drag-region
-          className="flex h-11 shrink-0 items-center gap-2 border-b bg-sidebar px-3 text-sidebar-foreground in-data-[titlebar=overlay]:pl-[86px]"
+          className="flex h-9 shrink-0 items-center gap-2 border-b bg-sidebar px-3 text-sidebar-foreground in-data-[titlebar=overlay]:pl-[86px]"
         >
           <LiteLogomark className="size-5" />
+          {/* A local build names its commit and is red, so it is never mistaken for the installed copy.
+              A release names its version and says at a glance whether it is the current one. */}
+          {commit || version ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Badge
+                    variant={commit ? "error" : BADGE_VARIANT[release]}
+                    render={<button type="button" onClick={() => void checkForUpdates()} />}
+                  >
+                    {commit || version}
+                  </Badge>
+                }
+              />
+              <TooltipContent>
+                {commit ? (
+                  `Local build${built ? ` from ${built}` : ""} · click to compare with your working tree`
+                ) : (
+                  <span className="flex flex-col gap-0.5">
+                    <span>
+                      {`Lite ${version}${RELEASE_NOTE[release]}`}
+                      {built ? ` · released ${built}` : ""}
+                    </span>
+                    <button
+                      type="button"
+                      className="underline underline-offset-2"
+                      onClick={() =>
+                        void invoke("open_url", {
+                          url: `https://github.com/ultralytics/lite/releases/tag/v${version}`,
+                        })
+                      }
+                    >
+                      View this release on GitHub
+                    </button>
+                  </span>
+                )}
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
           {selected ? (
             <>
               <Separator orientation="vertical" className="mx-1 h-4" />
@@ -549,7 +641,9 @@ function App() {
               <DropdownMenuContent align="end" className="w-48">
                 {version ? (
                   <DropdownMenuGroup>
-                    <DropdownMenuLabel>Lite {version}</DropdownMenuLabel>
+                    <DropdownMenuLabel>
+                      {commit ? `Lite ${version} · local ${commit}` : `Lite ${version}`}
+                    </DropdownMenuLabel>
                     <DropdownMenuSeparator />
                   </DropdownMenuGroup>
                 ) : null}
@@ -695,11 +789,22 @@ function App() {
             <DialogHeader>
               <DialogTitle>Lite updates</DialogTitle>
               <DialogDescription aria-live="polite">
-                {updateStatus === "checking" ? "Checking GitHub for the latest release…" : null}
+                {updateStatus === "checking"
+                  ? commit
+                    ? "Comparing this build with the tree it was built from…"
+                    : "Checking GitHub for the latest release…"
+                  : null}
                 {updateStatus === "available"
                   ? `Lite ${availableVersion} is ready. Updating stops running sessions; their tabs resume after restart.`
                   : null}
-                {updateStatus === "current" ? "You have the latest version of Lite." : null}
+                {updateStatus === "rebuild"
+                  ? `This build is ${commit} and the tree is now ${availableVersion}. Run bun run local to rebuild.`
+                  : null}
+                {updateStatus === "current"
+                  ? commit
+                    ? "This build matches the tree it was built from."
+                    : "You have the latest version of Lite."
+                  : null}
                 {updateStatus === "installing" ? "Downloading and installing the update…" : null}
                 {updateStatus === "error" ? `Update failed: ${updateError}` : null}
               </DialogDescription>
@@ -715,7 +820,7 @@ function App() {
                 <Button onClick={() => void installUpdate()}>Install and restart</Button>
               </DialogFooter>
             ) : null}
-            {updateStatus === "current" ? (
+            {updateStatus === "current" || updateStatus === "rebuild" ? (
               <DialogFooter>
                 <Button onClick={() => changeUpdateOpen(false)}>Done</Button>
               </DialogFooter>
