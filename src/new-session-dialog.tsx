@@ -17,6 +17,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { type Agent, type ModelProvider, type Session, sessionLabel } from "@/types";
@@ -177,17 +178,17 @@ export function NewSessionDialog({
 
   return (
     <Dialog open={isOpen} onOpenChange={changeOpen}>
-      <DialogContent size="lg">
-        <form onSubmit={submit}>
+      <DialogContent className="sm:max-w-lg">
+        <form onSubmit={submit} className="flex min-h-0 flex-1 flex-col gap-4">
           <DialogHeader>
             <DialogTitle>New session</DialogTitle>
             <DialogDescription>Pick a project folder, then choose the agent that should work in it.</DialogDescription>
           </DialogHeader>
           <DialogBody className="space-y-4">
             <div className="space-y-1.5">
-              <label htmlFor="project-folder" className={SECTION}>
+              <Label htmlFor="project-folder" className={SECTION}>
                 Project folder
-              </label>
+              </Label>
               <div className="flex gap-2">
                 <Input
                   id="project-folder"
@@ -201,7 +202,7 @@ export function NewSessionDialog({
                   size="icon"
                   tooltip="Browse"
                   aria-label="Browse for a folder"
-                  onClick={chooseFolder}
+                  onClick={() => void chooseFolder()}
                 >
                   <FolderOpen />
                 </ActionIconButton>

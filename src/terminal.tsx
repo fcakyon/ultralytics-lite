@@ -7,7 +7,7 @@ import { type ITheme, Terminal } from "@xterm/xterm";
 import { useEffect, useRef } from "react";
 import "@xterm/xterm/css/xterm.css";
 
-import { subscribeOutput } from "@/output-store";
+import { subscribeOutput, writeSession } from "@/output-store";
 import type { Theme } from "@/theme";
 
 // Surface colors follow the app tokens; ANSI colors follow GitHub light and dark, matching the code preview.
@@ -141,10 +141,7 @@ export function TerminalView({
         } else if (character === "\u007f") typed = typed.slice(0, -1);
         else if (character >= " ") typed += character;
       }
-      void invoke("write_session", {
-        sessionId,
-        data: Array.from(new TextEncoder().encode(data)),
-      });
+      writeSession(sessionId, data);
     });
     const resize = () => {
       fit.fit();

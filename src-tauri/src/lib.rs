@@ -261,13 +261,20 @@ fn last_directory_path(app: &AppHandle) -> Result<PathBuf, String> {
         .join("last-directory"))
 }
 
-fn load_roots(app: &AppHandle) -> Roots {
-    let roots = roots_path(app)
+fn read_roots(path: &Path) -> HashMap<String, PathBuf> {
+    fs::read(path)
         .ok()
-        .and_then(|path| fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<HashMap<String, PathBuf>>(&bytes).ok())
-        .unwrap_or_default();
-    Roots(Mutex::new(roots))
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn load_roots(app: &AppHandle) -> Roots {
+    Roots(Mutex::new(
+        roots_path(app)
+            .as_deref()
+            .map(read_roots)
+            .unwrap_or_default(),
+    ))
 }
 
 // Codex threads are UUIDs and Kimi sessions are short opaque ids, so both are held to a safe file-name charset.
@@ -344,7 +351,13 @@ fn update_roots(
 ) -> Result<(), String> {
     let path = roots_path(app)?;
     let mut roots = roots.0.lock().map_err(|error| error.to_string())?;
-    let mut next = roots.clone();
+    // A second copy of Lite writes this same file — a shell session inside Lite that launches the app
+    // is enough to make two. Writing this process's map alone would drop every grant the other one has
+    // made since startup, and the sessions holding them would be told their folder is no longer theirs.
+    // So the change is made against the file rather than against the map this copy loaded at startup,
+    // and only the one grant it is adding or removing goes with it: re-asserting the rest would hand
+    // back the grants another copy has since revoked, which is the opposite of closing a session.
+    let mut next = read_roots(&path);
     update(&mut next);
     write_atomic(
         &path,
@@ -578,6 +591,140 @@ async fn use_directory(
     let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
     write_atomic(&last_directory_path(&app)?, path_text(&path).as_bytes())?;
     grant_directory(&app, &roots, path)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequest {
+    url: String,
+    title: Option<String>,
+    state: Option<String>,
+}
+
+// The number and the repository a pull request link names, or nothing if the link is not one.
+fn pull_request_parts(url: &str) -> Option<(String, String, String)> {
+    let mut parts = url.strip_prefix("https://github.com/")?.split('/');
+    let owner = parts.next().filter(|part| !part.is_empty())?;
+    let repository = parts.next().filter(|part| !part.is_empty())?;
+    if parts.next()? != "pull" {
+        return None;
+    }
+    let number = parts.next()?;
+    if number.is_empty() || !number.chars().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    Some((owner.to_owned(), repository.to_owned(), number.to_owned()))
+}
+
+// What GitHub had to say, as opposed to whether Lite managed to ask. Missing is the only answer that
+// removes a link, so everything that is merely a failure to ask has to arrive as Unknown instead.
+enum Answer {
+    Found(serde_json::Value),
+    Missing,
+    Unknown,
+}
+
+fn gh_api(gh: &Path, endpoint: &str) -> Answer {
+    let Ok(output) = Command::new(gh).args(["api", endpoint]).output() else {
+        return Answer::Unknown;
+    };
+    if output.status.success() {
+        return serde_json::from_slice(&output.stdout).map_or(Answer::Unknown, Answer::Found);
+    }
+    if String::from_utf8_lossy(&output.stderr).contains("HTTP 404") {
+        Answer::Missing
+    } else {
+        Answer::Unknown
+    }
+}
+
+// A session prints as many links as it prints, and each one checked is a round trip; past a point the
+// panel would be waiting on the network rather than saying what a session did. The rest are shown the
+// way they were printed.
+const CHECKED_PULL_REQUESTS: usize = 20;
+
+// A pull request link is read back out of what a session printed, so a number mistyped into the
+// terminal reaches the panel looking exactly like one that exists. GitHub is the only thing that can
+// tell the two apart, and gh is how Lite asks: it is the tool that printed most of these links, it
+// carries whatever sign-in the person using it has, and asking it is not the same as reading that
+// sign-in. A link is only dropped on evidence that it names nothing; everything else is shown exactly
+// as it was printed, whether gh is missing, the laptop is offline, or the repository is one this
+// sign-in cannot see. That last case is why a 404 alone is not evidence: GitHub answers 404 for a
+// private repository it will not admit to as readily as for a number that was never a pull request.
+// So the repository is asked for too, and only a repository that can be read makes the number a
+// mistake — otherwise a sign-in to the wrong account would quietly delete real work from the panel.
+fn check_pull_requests(urls: Vec<String>) -> Vec<PullRequest> {
+    let gh = resolve_executable("gh");
+    let mut found = Vec::new();
+    let mut readable: HashMap<String, bool> = HashMap::new();
+    let mut checked = 0;
+    for url in urls {
+        let Some((owner, repository, number)) = pull_request_parts(&url) else {
+            continue;
+        };
+        let unchecked = PullRequest {
+            url: url.clone(),
+            title: None,
+            state: None,
+        };
+        let (Some(gh), true) = (gh.as_ref(), checked < CHECKED_PULL_REQUESTS) else {
+            found.push(unchecked);
+            continue;
+        };
+        checked += 1;
+        match gh_api(gh, &format!("repos/{owner}/{repository}/pulls/{number}")) {
+            Answer::Found(body) => {
+                // Merged and draft are states of their own; GitHub reports both beside open or closed.
+                let state = if body["merged"].as_bool() == Some(true) {
+                    "merged"
+                } else if body["state"].as_str() == Some("closed") {
+                    "closed"
+                } else if body["draft"].as_bool() == Some(true) {
+                    "draft"
+                } else {
+                    "open"
+                };
+                found.push(PullRequest {
+                    url,
+                    title: body["title"].as_str().map(str::to_owned),
+                    state: Some(state.to_owned()),
+                });
+            }
+            Answer::Missing => {
+                // Asked once per repository rather than once per link: twenty links into one repository
+                // nobody here can read are twenty identical answers.
+                let name = format!("{owner}/{repository}");
+                let readable = *readable.entry(name.clone()).or_insert_with(|| {
+                    matches!(gh_api(gh, &format!("repos/{name}")), Answer::Found(_))
+                });
+                if !readable {
+                    found.push(unchecked);
+                }
+            }
+            Answer::Unknown => found.push(unchecked),
+        }
+    }
+    found
+}
+
+// Each check waits on a process and a network round trip, so the run is moved off the runtime the rest
+// of Lite's commands share rather than holding one of its workers for the length of it.
+#[tauri::command]
+async fn pull_requests(urls: Vec<String>) -> Vec<PullRequest> {
+    // A run that never finished answered nothing, and nothing is not evidence that a link names
+    // nothing, so the links come back the way they were printed rather than as an empty panel.
+    let unanswered: Vec<PullRequest> = urls
+        .iter()
+        .filter(|url| pull_request_parts(url).is_some())
+        .map(|url| PullRequest {
+            url: url.clone(),
+            title: None,
+            state: None,
+        })
+        .collect();
+    tauri::async_runtime::spawn_blocking(move || check_pull_requests(urls))
+        .await
+        .unwrap_or(unanswered)
 }
 
 #[tauri::command]
@@ -2173,6 +2320,22 @@ fn local_commit() -> Option<&'static str> {
     option_env!("LITE_COMMIT")
 }
 
+// The tree a local build came from, which is the one place a rebuild of it can be run.
+#[tauri::command]
+fn local_repo() -> Option<&'static str> {
+    option_env!("LITE_REPO")
+}
+
+// That same tree, opened for the one thing Lite does with it. The path is the one compiled into this
+// build rather than one handed in, and it deliberately does not go through use_directory: that records
+// what it opens as the folder to offer next, and rebuilding Lite is not the same as choosing to work
+// in it. The sensitive-folder rule still applies, as it does to every other grant.
+#[tauri::command]
+async fn grant_repo(app: AppHandle, roots: State<'_, Roots>) -> Result<DirectoryGrant, String> {
+    let repo = option_env!("LITE_REPO").ok_or("This build did not record where it came from")?;
+    grant_directory(&app, &roots, PathBuf::from(repo))
+}
+
 #[tauri::command]
 async fn check_update(app: AppHandle) -> Result<Option<String>, String> {
     app.updater_builder()
@@ -2261,6 +2424,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_directory,
+            pull_requests,
             use_directory,
             default_directory,
             revoke_directory,
@@ -2283,6 +2447,8 @@ pub fn run() {
             check_update,
             install_update,
             local_commit,
+            grant_repo,
+            local_repo,
             build_date,
             local_update
         ])

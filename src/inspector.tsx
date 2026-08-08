@@ -5,17 +5,39 @@ import {
   ChartNoAxesColumn,
   ChevronLeft,
   ChevronRight,
+  Container,
+  Database,
   File,
+  FileArchive,
+  FileAudio,
+  FileCode,
+  FileCog,
+  FileDiff,
+  FileImage,
+  FileJson,
+  FileKey,
+  FileLock,
+  FileSpreadsheet,
+  FileTerminal,
+  FileText,
+  FileType,
+  FileVideo,
   Folder,
   GitBranch,
   GitPullRequest,
+  Hammer,
+  type LucideIcon,
   RefreshCw,
+  Scale,
   X,
 } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { ActionIconButton } from "@/components/ui/button";
+import { Empty, EmptyDescription, EmptyHeader } from "@/components/ui/empty";
+import { Item, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemTitle } from "@/components/ui/item";
+import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -48,6 +70,22 @@ function pullLabel(url: string) {
   return `${owner}/${repository} #${number}`;
 }
 
+// Every optional field arrives from Serde as null, never as a missing key. A state of null is a link
+// GitHub could not be asked about rather than one it disowned; those are dropped before they arrive.
+interface PullRequest {
+  url: string;
+  title: string | null;
+  state: keyof typeof PULL_STATE | null;
+}
+
+// The colors GitHub itself answers in, so a glance here reads the same as a glance there.
+const PULL_STATE = {
+  open: "success",
+  draft: "secondary",
+  merged: "purple",
+  closed: "error",
+} as const;
+
 // One list so a tab, its icon and the name every surface calls it by cannot drift apart, including the
 // rail the panel collapses to.
 const TABS = [
@@ -78,24 +116,87 @@ const formatNumber = new Intl.NumberFormat(undefined, {
   maximumFractionDigits: 1,
 });
 
+// A quota window turns over on the minute as far as anyone using it is concerned, so it is named to
+// the minute; the seconds only ever changed the width of the line.
+const formatTime = new Intl.DateTimeFormat(undefined, {
+  year: "numeric",
+  month: "numeric",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+// A tree is read by shape before it is read by name, so each family of file gets its own icon and its
+// own color and the plain sheet is left for the types nothing here recognizes. Languages are colored
+// the way their own ecosystems are, which is what makes a folder scannable at a glance.
+type FileKind = { icon: LucideIcon; color: string };
+
+const FILE_FAMILIES: (FileKind & { extensions: string[] })[] = [
+  { icon: FileCode, color: "text-sky-500", extensions: ["py", "pyi", "pyw"] },
+  { icon: FileCode, color: "text-amber-500", extensions: ["js", "jsx", "mjs", "cjs"] },
+  { icon: FileCode, color: "text-blue-500", extensions: ["ts", "tsx", "mts", "cts"] },
+  { icon: FileCode, color: "text-orange-600", extensions: ["rs"] },
+  { icon: FileCode, color: "text-cyan-500", extensions: ["go"] },
+  { icon: FileCode, color: "text-violet-500", extensions: ["c", "cc", "cpp", "cxx", "h", "hpp", "cs", "java", "kt"] },
+  { icon: FileCode, color: "text-rose-500", extensions: ["rb", "php", "swift"] },
+  { icon: FileCode, color: "text-orange-500", extensions: ["html", "htm", "xml", "vue", "svelte"] },
+  { icon: FileCode, color: "text-fuchsia-500", extensions: ["css", "scss", "sass", "less"] },
+  { icon: FileJson, color: "text-amber-500", extensions: ["json", "jsonc", "json5"] },
+  { icon: FileCog, color: "text-stone-500", extensions: ["yaml", "yml", "toml", "ini", "cfg", "conf", "editorconfig"] },
+  { icon: FileCog, color: "text-stone-500", extensions: ["gitignore", "gitattributes", "dockerignore"] },
+  { icon: FileKey, color: "text-amber-600", extensions: ["env", "pem", "key", "crt", "cert"] },
+  { icon: FileLock, color: "text-stone-500", extensions: ["lock", "lockb"] },
+  { icon: FileTerminal, color: "text-emerald-500", extensions: ["sh", "bash", "zsh", "fish", "ps1", "bat", "cmd"] },
+  { icon: FileImage, color: "text-pink-500", extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "avif"] },
+  { icon: FileAudio, color: "text-purple-500", extensions: ["mp3", "wav", "flac", "ogg", "m4a"] },
+  { icon: FileVideo, color: "text-purple-500", extensions: ["mp4", "mov", "mkv", "webm", "avi"] },
+  { icon: FileSpreadsheet, color: "text-green-600", extensions: ["csv", "tsv", "xls", "xlsx", "parquet"] },
+  { icon: FileArchive, color: "text-stone-500", extensions: ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar"] },
+  { icon: Database, color: "text-indigo-500", extensions: ["sql", "db", "sqlite", "sqlite3"] },
+  { icon: FileType, color: "text-muted-foreground", extensions: ["woff", "woff2", "ttf", "otf"] },
+  { icon: FileDiff, color: "text-muted-foreground", extensions: ["diff", "patch"] },
+  { icon: FileText, color: "text-muted-foreground", extensions: ["md", "mdx", "rst", "txt", "adoc"] },
+];
+
+const FILE_TYPES = new Map<string, FileKind>(
+  FILE_FAMILIES.flatMap(({ icon, color, extensions }) => extensions.map((extension) => [extension, { icon, color }])),
+);
+
+// The few files a project names rather than extends, which say more than the extension they lack.
+const FILE_NAMES = new Map<string, FileKind>([
+  ["dockerfile", { icon: Container, color: "text-blue-500" }],
+  ["makefile", { icon: Hammer, color: "text-stone-500" }],
+  ["cmakelists.txt", { icon: Hammer, color: "text-stone-500" }],
+  ["license", { icon: Scale, color: "text-muted-foreground" }],
+]);
+
+function FileIcon({ name }: { name: string }) {
+  const lower = name.toLowerCase();
+  const kind = FILE_NAMES.get(lower) ?? FILE_TYPES.get(lower.split(".").pop() ?? "");
+  const Icon = kind?.icon ?? File;
+  return <Icon className={`size-3.5 shrink-0 ${kind?.color ?? "text-muted-foreground"}`} />;
+}
+
 function Loading({ label }: { label: string }) {
   return (
-    <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground">
-      <Spinner className="size-3.5" />
+    <div className="flex items-center gap-2 p-3 text-sm text-muted-foreground">
+      <Spinner />
       {label}
     </div>
   );
 }
 
-function Meter({ value }: { value: number }) {
+// A window that is nearly spent is the one thing here worth a color, so it recolors the bar it fills.
+function Meter({ label, value }: { label: string; value: number }) {
   const bounded = Math.max(0, Math.min(100, value));
   return (
-    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
-      <div
-        className={`h-full rounded-full transition-[width] ${bounded >= 90 ? "bg-destructive" : "bg-foreground"}`}
-        style={{ width: `${bounded}%` }}
-      />
-    </div>
+    <Progress
+      value={bounded}
+      className={bounded >= 90 ? "[&_[data-slot=progress-indicator]]:bg-destructive" : undefined}
+    >
+      <ProgressLabel className="truncate">{label}</ProgressLabel>
+      <ProgressValue />
+    </Progress>
   );
 }
 
@@ -173,7 +274,7 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
               ) : (
                 <>
                   <span className="w-3.5" />
-                  <File className="size-3.5 text-muted-foreground" />
+                  <FileIcon name={entry.name} />
                 </>
               )}
               <span className="truncate">{entry.name}</span>
@@ -248,10 +349,9 @@ function FilesPanel({ root, rootId }: { root: string; rootId: string }) {
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="flex h-9 shrink-0 items-center gap-2 border-b px-2">
-          <File className="size-3.5 shrink-0 text-muted-foreground" />
+          <FileIcon name={selected.name} />
           <span className="min-w-0 flex-1 truncate font-mono text-xs">{selected.name}</span>
           <ActionIconButton
-            variant="ghost"
             size="icon-sm"
             tooltip="Close file"
             aria-label="Close file"
@@ -286,7 +386,26 @@ function GitPanel({ rootId, sessionId }: { rootId: string; sessionId: string }) 
   // rebuilds it, and nothing here watches the session between those two moments.
   const named = useMemo(() => namedInSession(sessionId), [sessionId]);
   const [status, setStatus] = useState<GitStatus | null>();
+  const [pulls, setPulls] = useState<PullRequest[]>();
   const [error, setError] = useState("");
+
+  // The panel is only built when the tab is opened and again whenever it is refreshed, so asking
+  // GitHub here asks it exactly on those two occasions and never between them.
+  useEffect(() => {
+    if (!named.pulls.length) return setPulls([]);
+    let disposed = false;
+    void invoke<PullRequest[]>("pull_requests", { urls: named.pulls })
+      .then((checked) => {
+        if (!disposed) setPulls(checked);
+      })
+      // A link that could not be checked is still a link, so it is shown the way it was printed.
+      .catch(() => {
+        if (!disposed) setPulls(named.pulls.map((url) => ({ url, title: null, state: null })));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [named]);
 
   const refresh = useCallback(async () => {
     setError("");
@@ -304,71 +423,92 @@ function GitPanel({ rootId, sessionId }: { rootId: string; sessionId: string }) 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <ScrollArea className="min-h-0 flex-1">
-        <div className="p-3 text-xs">
+        <div className="p-3">
           {error ? (
-            <p className="text-destructive">{error}</p>
+            <p className="text-sm text-destructive">{error}</p>
           ) : status === undefined ? (
             <Loading label="Reading Git status…" />
           ) : status === null ? (
-            <p className="text-muted-foreground">This folder is not a Git repository.</p>
+            <Empty>
+              <EmptyHeader>
+                <EmptyDescription>This folder is not a Git repository.</EmptyDescription>
+              </EmptyHeader>
+            </Empty>
           ) : (
-            <>
-              <div className="space-y-2 rounded-lg border p-3">
-                <div className="flex items-center gap-2">
-                  <GitBranch className="size-3.5 shrink-0" />
-                  <span className="truncate font-mono font-medium">{status.branch}</span>
-                </div>
-                <p className="truncate font-mono text-muted-foreground" title={status.worktree}>
-                  {status.worktree}
-                </p>
+            <div className="flex flex-col gap-4">
+              <Item variant="outline">
+                <ItemMedia variant="icon">
+                  <GitBranch />
+                </ItemMedia>
+                <ItemContent>
+                  <ItemTitle className="font-mono">{status.branch}</ItemTitle>
+                  <ItemDescription className="font-mono" title={status.worktree}>
+                    {status.worktree}
+                  </ItemDescription>
+                </ItemContent>
                 <Badge variant={status.changes.length ? "secondary" : "outline"}>
                   {status.changes.length
                     ? `${status.changes.length}${status.changesTruncated ? "+" : ""} changed`
                     : "Clean"}
                 </Badge>
-              </div>
+              </Item>
               {status.changes.length ? (
-                <div className="mt-4">
-                  <p className="mb-2 font-medium">Changes</p>
-                  {status.changes.map((change) => (
-                    <div key={change} className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted">
-                      <span className="w-5 shrink-0 font-mono text-[11px] text-muted-foreground">
-                        {change.slice(0, 2).trim()}
-                      </span>
-                      <span className="truncate font-mono" title={change.slice(3)}>
-                        {change.slice(3)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
+                <section className="flex flex-col gap-2">
+                  <p className="text-sm font-medium">Changes</p>
+                  <ItemGroup>
+                    {status.changes.map((change) => (
+                      <Item key={change} size="xs" className="hover:bg-muted">
+                        <span className="w-5 shrink-0 font-mono text-xs text-muted-foreground">
+                          {change.slice(0, 2).trim()}
+                        </span>
+                        <span className="truncate font-mono text-sm" title={change.slice(3)}>
+                          {change.slice(3)}
+                        </span>
+                      </Item>
+                    ))}
+                  </ItemGroup>
+                </section>
               ) : null}
-              <div className="mt-4">
-                <p className="mb-2 font-medium">Named in this session</p>
-                {named.branches.map((branch) => (
-                  <div key={branch} className="flex items-center gap-2 rounded-md px-2 py-1.5">
-                    <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
-                    <span className="truncate font-mono">{branch}</span>
-                  </div>
-                ))}
-                {named.pulls.map((url) => (
-                  <button
-                    key={url}
-                    type="button"
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted"
-                    title={url}
-                    onClick={() => void invoke("open_url", { url })}
-                  >
-                    <GitPullRequest className="size-3.5 shrink-0 text-muted-foreground" />
-                    <span className="truncate font-mono underline-offset-2 hover:underline">{pullLabel(url)}</span>
-                  </button>
-                ))}
-                {named.branches.length || named.pulls.length ? null : (
-                  <p className="px-2 text-muted-foreground">
+              <section className="flex flex-col gap-2">
+                <p className="text-sm font-medium">Named in this session</p>
+                <ItemGroup>
+                  {named.branches.map((branch) => (
+                    <Item key={branch} size="xs">
+                      <ItemMedia variant="icon" className="text-muted-foreground">
+                        <GitBranch />
+                      </ItemMedia>
+                      <span className="truncate font-mono text-sm">{branch}</span>
+                    </Item>
+                  ))}
+                  {pulls?.map(({ url, title, state }) => (
+                    <Item
+                      key={url}
+                      size="xs"
+                      className="hover:bg-muted"
+                      render={<button type="button" title={url} onClick={() => void invoke("open_url", { url })} />}
+                    >
+                      <ItemMedia variant="icon" className="text-muted-foreground">
+                        <GitPullRequest />
+                      </ItemMedia>
+                      <ItemContent>
+                        <ItemTitle className="underline-offset-2 group-hover/item:underline">
+                          {title ?? pullLabel(url)}
+                        </ItemTitle>
+                        {title ? <ItemDescription className="font-mono">{pullLabel(url)}</ItemDescription> : null}
+                      </ItemContent>
+                      {state ? <Badge variant={PULL_STATE[state]}>{state}</Badge> : null}
+                    </Item>
+                  ))}
+                </ItemGroup>
+                {pulls === undefined && named.pulls.length ? <Loading label="Checking pull requests…" /> : null}
+                {/* Also what is left when every link a session printed turned out to name nothing. */}
+                {pulls && !named.branches.length && !pulls.length ? (
+                  <ItemDescription>
                     Branches this session checked out and pull request links it printed appear here.
-                  </p>
-                )}
-              </div>
-            </>
+                  </ItemDescription>
+                ) : null}
+              </section>
+            </div>
           )}
         </div>
       </ScrollArea>
@@ -412,60 +552,60 @@ function UsagePanel({ session }: { session: Session }) {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <ScrollArea className="min-h-0 flex-1">
-        <div className="space-y-3 p-3 text-xs">
+        <div className="p-3">
           {error ? (
-            <p className="text-destructive">{error}</p>
+            <p className="text-sm text-destructive">{error}</p>
           ) : usage === undefined ? (
             <Loading label="Reading provider usage…" />
           ) : usage === null ? (
-            <p className="text-muted-foreground">{missingUsage(session)}</p>
+            <Empty>
+              <EmptyHeader>
+                <EmptyDescription>{missingUsage(session)}</EmptyDescription>
+              </EmptyHeader>
+            </Empty>
           ) : (
-            <>
+            <ItemGroup>
               {usage.contextUsedPercent != null ? (
-                <div className="rounded-lg border p-3">
-                  <div className="flex justify-between">
-                    <span>Session context</span>
-                    <span className="tabular-nums">{usage.contextUsedPercent.toFixed(0)}%</span>
-                  </div>
-                  <Meter value={usage.contextUsedPercent} />
+                <Item variant="outline" className="flex-col items-stretch">
+                  <Meter label="Session context" value={usage.contextUsedPercent} />
                   {usage.contextTokens != null ? (
-                    <p className="mt-2 text-muted-foreground tabular-nums">
+                    <ItemDescription className="tabular-nums">
                       {formatNumber.format(usage.contextTokens)}
                       {usage.contextWindow ? ` of ${formatNumber.format(usage.contextWindow)}` : ""} tokens
-                    </p>
+                    </ItemDescription>
                   ) : null}
                   {usage.costUsd != null ? (
-                    <p className="mt-1 text-muted-foreground tabular-nums">${usage.costUsd.toFixed(2)} session cost</p>
+                    <ItemDescription className="tabular-nums">${usage.costUsd.toFixed(2)} session cost</ItemDescription>
                   ) : null}
-                </div>
+                </Item>
               ) : (
-                <p className="text-muted-foreground">
+                <ItemDescription>
                   {session.agent === "codex" ? "The Codex CLI" : "This provider"} does not report per-session context.
-                </p>
+                </ItemDescription>
               )}
               {usage.windows.map((window) => (
-                <div key={`${window.label}-${window.windowMinutes ?? ""}`} className="rounded-lg border p-3">
-                  <div className="flex justify-between gap-2">
-                    <span className="truncate">{window.label}</span>
-                    <span className="tabular-nums">{window.usedPercent.toFixed(0)}%</span>
-                  </div>
-                  <Meter value={window.usedPercent} />
+                <Item
+                  key={`${window.label}-${window.windowMinutes ?? ""}`}
+                  variant="outline"
+                  className="flex-col items-stretch"
+                >
+                  <Meter label={window.label} value={window.usedPercent} />
                   {window.resetsAt != null ? (
-                    <p className="mt-2 text-muted-foreground">
-                      Resets {new Date(window.resetsAt * 1000).toLocaleString()}
-                    </p>
+                    <ItemDescription>Resets {formatTime.format(window.resetsAt * 1000)}</ItemDescription>
                   ) : null}
-                </div>
+                </Item>
               ))}
               {usage.lifetimeTokens != null ? (
-                <div className="rounded-lg border p-3">
-                  <p className="text-muted-foreground">Provider total</p>
-                  <p className="mt-1 text-lg font-medium tabular-nums">
-                    {formatNumber.format(usage.lifetimeTokens)} tokens
-                  </p>
-                </div>
+                <Item variant="outline">
+                  <ItemContent>
+                    <ItemDescription>Provider total</ItemDescription>
+                    <ItemTitle className="text-lg tabular-nums">
+                      {formatNumber.format(usage.lifetimeTokens)} tokens
+                    </ItemTitle>
+                  </ItemContent>
+                </Item>
               ) : null}
-            </>
+            </ItemGroup>
           )}
         </div>
       </ScrollArea>
@@ -495,7 +635,6 @@ export function Inspector({
   const rail = (
     <div className="flex animate-in flex-col items-center gap-0.5 py-1.5 fade-in duration-200">
       <ActionIconButton
-        variant="ghost"
         size="icon-sm"
         tooltip="Expand panel"
         tooltipSide="left"
@@ -529,13 +668,7 @@ export function Inspector({
       <div className={collapsed ? "hidden" : "h-full"}>
         <Tabs value={tab} onValueChange={setTab} className="h-full min-h-0 gap-0">
           <div className="flex h-11 shrink-0 items-center gap-0.5 border-b pr-3 pl-1.5">
-            <ActionIconButton
-              variant="ghost"
-              size="icon-sm"
-              tooltip="Collapse panel"
-              aria-label="Collapse panel"
-              onClick={onCollapse}
-            >
+            <ActionIconButton size="icon-sm" tooltip="Collapse panel" aria-label="Collapse panel" onClick={onCollapse}>
               <ChevronRight />
             </ActionIconButton>
             <TabsList variant="line">
@@ -551,7 +684,6 @@ export function Inspector({
             <span className="ml-auto flex items-center">
               {tab === "usage" && session.agent === "shell" ? null : (
                 <ActionIconButton
-                  variant="ghost"
                   size="icon-sm"
                   tooltip="Refresh"
                   aria-label="Refresh"

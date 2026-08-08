@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  Check,
   ChevronLeft,
   ChevronRight,
   GitBranch,
@@ -44,7 +45,10 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
+import { Item, ItemActions, ItemMedia } from "@/components/ui/item";
 import {
   type PanelImperativeHandle,
   ResizableHandle,
@@ -57,7 +61,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Inspector } from "@/inspector";
 import { NewSessionDialog } from "@/new-session-dialog";
-import { appendOutput, clearOutput, subscribeOutput } from "@/output-store";
+import { appendOutput, clearOutput, subscribeOutput, writeSession } from "@/output-store";
 import { SettingsDialog } from "@/settings-dialog";
 import { applyTheme, initialTheme, type Theme } from "@/theme";
 import { type Session, sessionLabel } from "@/types";
@@ -274,6 +278,22 @@ function SessionBadge({
   );
 }
 
+// The provider's own mark, at the size a page can be about rather than the size a row can carry. It is
+// the same mark the sidebar tile and the agent chooser wear, so a session looks like itself wherever it
+// is met; here it is what the empty terminal is waiting on, so it is the thing worth looking at. While
+// a session is still coming up the mark keeps a turning ring, which says starting without adding a
+// second object to the page for the eye to land on.
+function SessionMark({ session, busy = false }: { session: Session; busy?: boolean }) {
+  return (
+    <EmptyMedia variant="icon" className="relative size-14 rounded-2xl">
+      <ProviderIcon agent={session.agent} provider={session.provider} className="size-7" />
+      {busy ? (
+        <Spinner className="absolute -inset-1 size-auto text-muted-foreground/40" strokeWidth={1} aria-hidden="true" />
+      ) : null}
+    </EmptyMedia>
+  );
+}
+
 function SessionRow({
   session,
   active,
@@ -304,51 +324,51 @@ function SessionRow({
   }
 
   return (
-    <div
-      className={`group flex items-center rounded-lg pr-1 ${active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/60"}`}
+    <Item
+      size="xs"
+      // Never wrapped: Item wraps by default, and a row narrow enough to push the buttons onto a second
+      // line takes the tooltip's anchor out from under the pointer that opened it.
+      className={`flex-nowrap ${active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/60"}`}
     >
-      <div className="flex min-w-0 flex-1 items-center gap-2.5 py-1.5 pl-2">
+      <ItemMedia>
         <SessionBadge session={session} active={active} starting={starting} working={working} />
-        {renaming ? (
-          <span className="min-w-0 flex-1 py-0.5">
-            <Input
-              autoFocus
-              value={name}
-              className="px-1.5"
-              aria-label="Session name"
-              onChange={(event) => setName(event.target.value)}
-              onBlur={saveName}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") saveName();
-                if (event.key === "Escape") {
-                  setName(session.name);
-                  setRenaming(false);
-                }
-              }}
-            />
+      </ItemMedia>
+      {renaming ? (
+        <Input
+          autoFocus
+          value={name}
+          className="min-w-0 flex-1"
+          aria-label="Session name"
+          onChange={(event) => setName(event.target.value)}
+          onBlur={saveName}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") saveName();
+            if (event.key === "Escape") {
+              setName(session.name);
+              setRenaming(false);
+            }
+          }}
+        />
+      ) : (
+        /* Clicking a session opens it, and a stopped one comes back with it. Only the session already
+           open and running reads a click as a rename, so a name is still reachable without a menu and
+           a click never surprises you with a text field. */
+        <button
+          type="button"
+          className="min-w-0 flex-1 text-left"
+          onClick={() => (active && session.running ? setRenaming(true) : onSelect())}
+          onDoubleClick={() => setRenaming(true)}
+          title={session.cwd}
+        >
+          <span className="block truncate text-xs font-medium">{session.name}</span>
+          <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
+            {shortPath(session.cwd)}
           </span>
-        ) : (
-          /* Clicking a session opens it, and a stopped one comes back with it. Only the session already
-             open and running reads a click as a rename, so a name is still reachable without a menu and
-             a click never surprises you with a text field. */
-          <button
-            type="button"
-            className="min-w-0 flex-1 py-0.5 text-left"
-            onClick={() => (active && session.running ? setRenaming(true) : onSelect())}
-            onDoubleClick={() => setRenaming(true)}
-            title={session.cwd}
-          >
-            <span className="block truncate text-xs font-medium">{session.name}</span>
-            <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
-              {shortPath(session.cwd)}
-            </span>
-          </button>
-        )}
-      </div>
+        </button>
+      )}
       {/* Hidden rather than transparent, so a name gets the whole row until the pointer arrives. */}
-      <span className="hidden shrink-0 items-center group-hover:flex group-focus-within:flex">
+      <ItemActions className="hidden shrink-0 gap-0.5 group-hover/item:flex group-focus-within/item:flex">
         <ActionIconButton
-          variant="ghost"
           size="icon-sm"
           tooltip="Restart"
           aria-label={`Restart ${session.name}`}
@@ -358,7 +378,6 @@ function SessionRow({
           <RotateCcw />
         </ActionIconButton>
         <ActionIconButton
-          variant="ghost"
           size="icon-sm"
           className="hover:text-destructive"
           tooltip="Close session"
@@ -368,8 +387,8 @@ function SessionRow({
         >
           <Trash2 />
         </ActionIconButton>
-      </span>
-    </div>
+      </ItemActions>
+    </Item>
   );
 }
 
@@ -385,7 +404,7 @@ function startKimiConversation(sessionId: string) {
     sent = true;
     unsubscribe();
     clearTimeout(timer);
-    void invoke("write_session", { sessionId, data: Array.from(new TextEncoder().encode("/new\r")) });
+    writeSession(sessionId, "/new\r");
   };
   const unsubscribe = subscribeOutput(sessionId, (data) => {
     seen += decoder.decode(data, { stream: true });
@@ -393,6 +412,32 @@ function startKimiConversation(sessionId: string) {
   });
   // Its greeting may change; waiting forever for the words would be worse than asking a little late.
   const timer = setTimeout(send, 15_000);
+}
+
+// A session opened to run one command is sent it once the program in it has finished arriving. A shell
+// drains whatever was typed while it was still setting itself up — a prompt framework rebuilding its
+// line editor throws the queue away — so the command waits for output to start and then to stop, rather
+// than for the first byte, which is the tty settling and not the prompt. A shell that prints nothing at
+// all is still sent the command rather than left holding it.
+const SETTLE_MS = 300;
+const GIVE_UP_MS = 5000;
+
+function runOnStart(sessionId: string, command: string) {
+  let sent = false;
+  let settle = 0;
+  const send = () => {
+    if (sent) return;
+    sent = true;
+    window.clearTimeout(settle);
+    window.clearTimeout(patience);
+    unsubscribe();
+    writeSession(sessionId, `${command}\r`);
+  };
+  const unsubscribe = subscribeOutput(sessionId, () => {
+    window.clearTimeout(settle);
+    settle = window.setTimeout(send, SETTLE_MS);
+  });
+  const patience = window.setTimeout(send, GIVE_UP_MS);
 }
 
 function folderName(cwd: string) {
@@ -447,6 +492,11 @@ function App() {
   // Undefined until asked: an empty string is a release, anything else is the commit it was built from.
   const [commit, setCommit] = useState<string>();
   const [built, setBuilt] = useState("");
+  // The tree a local build came from. A release came from no tree anyone here can see, and says so by
+  // leaving this empty.
+  const [repo, setRepo] = useState("");
+  // A rebuild is running, so the button that started it does not start a second one.
+  const [rebuilding, setRebuilding] = useState(false);
   const [release, setRelease] = useState<"checking" | "current" | "behind" | "unknown">("checking");
   const [updateOpen, setUpdateOpen] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("checking");
@@ -562,6 +612,9 @@ function App() {
     void invoke<string | null>("local_commit")
       .then((value) => setCommit(value ?? ""))
       .catch(() => setCommit(""));
+    void invoke<string | null>("local_repo")
+      .then((value) => setRepo(value ?? ""))
+      .catch(() => setRepo(""));
   }, []);
 
   // One owner for the release question, so the startup check and a manual one cannot contradict each
@@ -831,6 +884,35 @@ function App() {
     }
   }
 
+  // A local build is rebuilt by running one command in the tree it came from, so Lite opens that tree
+  // in a shell and runs it there rather than building out of sight: a build that fails says why, in the
+  // place its output belongs, and the tab stays afterwards like any other.
+  async function rebuild() {
+    // One build at a time: the dialog closes on the click, but checking again reopens it still behind
+    // its tree, and a second build would contend with the first over the same target and dist folders.
+    if (rebuilding) return;
+    setRebuilding(true);
+    try {
+      const folder = await invoke<{ id: string; path: string }>("grant_repo");
+      const session: Session = {
+        id: crypto.randomUUID(),
+        agent: "shell",
+        cwd: folder.path,
+        rootId: folder.id,
+        name: "Rebuild Lite",
+        renamed: true,
+        running: false,
+      };
+      setUpdateOpen(false);
+      createSession(session);
+      runOnStart(session.id, "bun run local");
+    } catch (reason) {
+      setRebuilding(false);
+      setUpdateError(String(reason));
+      setUpdateStatus("error");
+    }
+  }
+
   async function installUpdate() {
     setUpdateStatus("installing");
     try {
@@ -967,7 +1049,6 @@ function App() {
                 <ScrollArea className="min-h-0 flex-1">
                   <div className="flex animate-in flex-col items-center gap-0.5 py-1.5 fade-in duration-200">
                     <ActionIconButton
-                      variant="ghost"
                       size="icon-sm"
                       tooltip="Expand sessions"
                       tooltipSide="right"
@@ -977,7 +1058,6 @@ function App() {
                       <ChevronRight />
                     </ActionIconButton>
                     <ActionIconButton
-                      variant="ghost"
                       size="icon-sm"
                       tooltip="New session"
                       tooltipSide="right"
@@ -1013,12 +1093,13 @@ function App() {
               ) : (
                 <>
                   {/* The search field names the panel and searches it, so the list keeps the row a title would cost. */}
-                  <div className="flex h-9 shrink-0 items-center gap-0.5 pr-1.5 pl-2">
-                    <span className="relative min-w-0 flex-1">
-                      <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                      <Input
+                  <div className="flex h-11 shrink-0 items-center gap-0.5 pr-1.5 pl-2">
+                    <InputGroup>
+                      <InputGroupAddon>
+                        <Search />
+                      </InputGroupAddon>
+                      <InputGroupInput
                         value={query}
-                        className="h-7 pl-7 text-xs md:text-xs"
                         placeholder="Search sessions"
                         aria-label="Search sessions"
                         onChange={(event) => setQuery(event.target.value)}
@@ -1026,9 +1107,8 @@ function App() {
                           if (event.key === "Escape") setQuery("");
                         }}
                       />
-                    </span>
+                    </InputGroup>
                     <ActionIconButton
-                      variant="ghost"
                       size="icon-sm"
                       tooltip="New session"
                       aria-label="New session"
@@ -1037,7 +1117,6 @@ function App() {
                       <Plus />
                     </ActionIconButton>
                     <ActionIconButton
-                      variant="ghost"
                       size="icon-sm"
                       tooltip="Collapse sessions"
                       aria-label="Collapse sessions"
@@ -1096,36 +1175,47 @@ function App() {
                       />
                     </Suspense>
                   ) : startingIds.has(selected.id) ? (
-                    <div className="flex h-full flex-col items-center justify-center gap-3">
-                      <Spinner className="size-5 text-muted-foreground" />
-                      <p className="text-xs text-muted-foreground">Starting {sessionLabel(selected)}…</p>
-                    </div>
+                    <Empty className="h-full">
+                      <EmptyHeader>
+                        <SessionMark session={selected} busy />
+                        <EmptyTitle>Starting {sessionLabel(selected)}…</EmptyTitle>
+                        <EmptyDescription>{shortPath(selected.cwd)}</EmptyDescription>
+                      </EmptyHeader>
+                    </Empty>
                   ) : (
-                    <div className="flex h-full flex-col items-center justify-center gap-3">
-                      <p className="text-xs text-muted-foreground">This session is not running.</p>
-                      <Button variant="outline" size="sm" onClick={() => void launch(selected, true)}>
-                        <Play />
-                        Resume session
-                      </Button>
-                    </div>
+                    <Empty className="h-full">
+                      <EmptyHeader>
+                        <SessionMark session={selected} />
+                        <EmptyTitle>This session is not running</EmptyTitle>
+                        <EmptyDescription>Resuming reopens it in the folder it was started in.</EmptyDescription>
+                      </EmptyHeader>
+                      <EmptyContent>
+                        <Button variant="outline" onClick={() => void launch(selected, true)}>
+                          <Play />
+                          Resume session
+                        </Button>
+                      </EmptyContent>
+                    </Empty>
                   )}
                 </div>
               ) : (
-                <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
-                  <div className="flex size-12 items-center justify-center rounded-2xl border bg-muted">
-                    <SquareTerminal className="size-5" />
-                  </div>
-                  <div>
-                    <h1 className="text-sm font-medium">Start a session</h1>
-                    <p className="mt-1 text-xs text-muted-foreground">
+                <Empty className="h-full">
+                  <EmptyHeader>
+                    <EmptyMedia variant="icon">
+                      <SquareTerminal />
+                    </EmptyMedia>
+                    <EmptyTitle>Start a session</EmptyTitle>
+                    <EmptyDescription>
                       Pick a project folder, then choose the agent that should work in it.
-                    </p>
-                  </div>
-                  <Button onClick={() => setNewSessionOpen(true)}>
-                    <Plus />
-                    New session
-                  </Button>
-                </div>
+                    </EmptyDescription>
+                  </EmptyHeader>
+                  <EmptyContent>
+                    <Button onClick={() => setNewSessionOpen(true)}>
+                      <Plus />
+                      New session
+                    </Button>
+                  </EmptyContent>
+                </Empty>
               )}
               {error ? (
                 <div className="flex shrink-0 items-start gap-2 border-t bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -1170,7 +1260,10 @@ function App() {
           ) : null}
         </ResizablePanelGroup>
         <Dialog open={updateOpen} onOpenChange={changeUpdateOpen}>
-          <DialogContent showCloseButton={updateStatus !== "checking" && updateStatus !== "installing"}>
+          <DialogContent
+            className="sm:max-w-lg"
+            showCloseButton={updateStatus !== "checking" && updateStatus !== "installing"}
+          >
             <DialogHeader>
               <div className="flex items-center gap-2">
                 <DialogTitle>Lite updates</DialogTitle>
@@ -1192,22 +1285,51 @@ function App() {
                   ? `Lite ${availableVersion} is ready. Updating stops running sessions; their tabs resume after restart.`
                   : null}
                 {updateStatus === "rebuild"
-                  ? `This build is ${commit} and the tree is now ${availableVersion}. Run bun run local to rebuild.`
+                  ? `This build is ${commit} and the tree is now ${availableVersion}. Rebuilding runs bun run local in a shell tab, and replaces this build when it finishes.`
                   : null}
-                {updateStatus === "current"
-                  ? commit
-                    ? "This build matches the tree it was built from."
-                    : "You have the latest version of Lite."
-                  : null}
+                {updateStatus === "current" ? (
+                  <span className="flex items-center gap-1.5">
+                    <Check className="size-4 shrink-0 text-success" />
+                    {commit ? "This build matches the tree it was built from." : "You have the latest version of Lite."}
+                  </span>
+                ) : null}
                 {updateStatus === "installing" ? "Downloading and installing the update…" : null}
                 {updateStatus === "error" ? `Update failed: ${updateError}` : null}
               </DialogDescription>
             </DialogHeader>
-            {updateStatus === "checking" || updateStatus === "installing" ? (
-              <DialogBody>
+            <DialogBody>
+              {updateStatus === "checking" || updateStatus === "installing" ? (
                 <Spinner className="mx-auto size-5 text-muted-foreground" />
-              </DialogBody>
-            ) : null}
+              ) : (
+                // What this copy of Lite actually is, which is the first thing worth knowing when it and
+                // the tree disagree. A release has no tree to name and leaves those rows out.
+                <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-sm">
+                  <dt className="text-muted-foreground">Version</dt>
+                  <dd className="truncate font-mono">{version || "—"}</dd>
+                  {commit ? (
+                    <>
+                      <dt className="text-muted-foreground">Build</dt>
+                      <dd className="truncate font-mono">{commit}</dd>
+                    </>
+                  ) : null}
+                  {built ? (
+                    <>
+                      <dt className="text-muted-foreground">{commit ? "Built" : "Released"}</dt>
+                      <dd className="truncate">{built}</dd>
+                    </>
+                  ) : null}
+                  {repo ? (
+                    <>
+                      <dt className="text-muted-foreground">Source</dt>
+                      <dd className="truncate font-mono" title={repo}>
+                        {repo}
+                      </dd>
+                    </>
+                  ) : null}
+                </dl>
+              )}
+            </DialogBody>
+
             {updateStatus === "available" ? (
               <DialogFooter>
                 <Button variant="outline" onClick={() => changeUpdateOpen(false)}>
@@ -1216,7 +1338,18 @@ function App() {
                 <Button onClick={() => void installUpdate()}>Install and restart</Button>
               </DialogFooter>
             ) : null}
-            {updateStatus === "current" || updateStatus === "rebuild" ? (
+            {updateStatus === "rebuild" ? (
+              <DialogFooter>
+                <Button variant="outline" onClick={() => changeUpdateOpen(false)}>
+                  Not now
+                </Button>
+                <Button disabled={rebuilding} onClick={() => void rebuild()}>
+                  <Play />
+                  Rebuild
+                </Button>
+              </DialogFooter>
+            ) : null}
+            {updateStatus === "current" ? (
               <DialogFooter>
                 <Button onClick={() => changeUpdateOpen(false)}>Done</Button>
               </DialogFooter>
@@ -1229,7 +1362,7 @@ function App() {
           </DialogContent>
         </Dialog>
         <Dialog open={Boolean(closing)} onOpenChange={(open) => !open && setClosing(undefined)}>
-          <DialogContent size="sm">
+          <DialogContent>
             <DialogHeader>
               <DialogTitle>Close {closing?.name}?</DialogTitle>
               <DialogDescription>
