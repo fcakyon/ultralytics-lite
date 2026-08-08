@@ -87,6 +87,7 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Spinner } from "@/components/ui/spinner";
+import { Toaster, toast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Inspector } from "@/inspector";
 import { NewSessionDialog } from "@/new-session-dialog";
@@ -487,12 +488,11 @@ function AppContextMenu({
 const QUIET_MS = 1200;
 
 // Three states the sidebar dot tells apart: the terminal is gone, it is up and quiet, or it is up and
-// producing output. Each reuses a badge token, so the state survives a display where motion is
-// suppressed and the palette stays consistent with the rest of the interface.
+// producing output. Color carries the state when motion is suppressed, and animation only reinforces it.
 const SESSION_STATUS = {
   disconnected: { dot: "bg-muted-foreground/40", label: "Disconnected" },
   idle: { dot: "bg-success", label: "Connected, idle" },
-  working: { dot: "bg-primary animate-pulse motion-reduce:animate-none", label: "Connected, working" },
+  working: { dot: "bg-sky-500 animate-pulse motion-reduce:animate-none", label: "Connected, working" },
 } as const;
 
 // A local build names its commit and is red, so it is never mistaken for the installed copy.
@@ -666,9 +666,10 @@ function SessionRow({
     <Item
       data-context-session={session.id}
       size="xs"
+      onClick={onSelect}
       // Never wrapped: Item wraps by default, and a row narrow enough to push the buttons onto a second
       // line takes the tooltip's anchor out from under the pointer that opened it.
-      className={`flex-nowrap ${active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/60"}`}
+      className={`flex-nowrap transition-[color,background-color,opacity] active:opacity-70 ${active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/60"}`}
     >
       <ItemMedia>
         <SessionBadge session={session} active={active} starting={starting} working={working} />
@@ -690,23 +691,33 @@ function SessionRow({
           }}
         />
       ) : (
-        /* Clicking a session opens it, and a stopped one comes back with it. Only the session already
-           open and running reads a click as a rename, so a name is still reachable without a menu and
-           a click never surprises you with a text field. */
-        <button
-          type="button"
-          className="min-w-0 flex-1 text-left"
-          onClick={() => (active && session.running ? onRenamingChange(true) : onSelect())}
-          onDoubleClick={() => onRenamingChange(true)}
-          title={session.cwd}
-        >
-          <span className="block truncate text-xs font-medium">{session.name}</span>
-          <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
+        <div className="min-w-0 flex-1 text-left">
+          {/* Only the visible title owns rename; its hit area stops where its text stops. */}
+          <button
+            type="button"
+            className="block w-fit max-w-full truncate text-xs font-medium"
+            onClick={(event) => {
+              event.stopPropagation();
+              if (active && session.running) onRenamingChange(true);
+              else onSelect();
+            }}
+            onDoubleClick={() => onRenamingChange(true)}
+          >
+            {session.name}
+          </button>
+          <div
+            className="mt-0.5 block w-fit max-w-full truncate font-mono text-[10px] text-muted-foreground"
+            title={session.cwd}
+          >
             {shortPath(session.cwd)}
-          </span>
-        </button>
+          </div>
+        </div>
       )}
-      <ItemActions className="shrink-0 gap-0.5 opacity-0 group-hover/item:opacity-100 group-focus-within/item:opacity-100">
+      {/* Hidden rather than transparent, so the text gets the whole row until the actions appear. */}
+      <ItemActions
+        className="hidden shrink-0 gap-0.5 group-hover/item:flex group-focus-within/item:flex"
+        onClick={(event) => event.stopPropagation()}
+      >
         <ActionIconButton
           size="icon-sm"
           tooltip="Restart"
@@ -823,7 +834,7 @@ function App() {
   const [selectedId, setSelectedId] = useState(() => sessions[0]?.id ?? "");
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [closing, setClosing] = useState<Session | "all">();
+  const [closingAll, setClosingAll] = useState(false);
   const [error, setError] = useState("");
   const [startingIds, setStartingIds] = useState<Set<string>>(new Set());
   // Sessions whose terminal has written something recently, which is what separates a connected
@@ -874,7 +885,7 @@ function App() {
   visibleRef.current = visible;
   themeRef.current = theme;
   selectedRef.current = selected;
-  closeRef.current = setClosing;
+  closeRef.current = closeSession;
   openRef.current = (session) => {
     setSelectedId(session.id);
     if (!session.running) void launch(session, true);
@@ -1204,9 +1215,7 @@ function App() {
     await Promise.all(sessions.map((session) => restartSession(session, session.id === selectedId)));
   }
 
-  async function closeSession(session: Session) {
-    runs.current.delete(session.id);
-    await invoke("stop_session", { sessionId: session.id });
+  async function cleanupSession(session: Session) {
     let cleanupError = "";
     try {
       await invoke("delete_session_data", { sessionId: session.id });
@@ -1219,9 +1228,69 @@ function App() {
       cleanupError ||= String(reason);
     }
     clearOutput(session.id);
-    setSessions((current) => current.filter((item) => item.id !== session.id));
-    if (selectedId === session.id) setSelectedId(sessions.find((item) => item.id !== session.id)?.id ?? "");
     if (cleanupError) setError(`Session closed, but local cleanup failed: ${cleanupError}`);
+  }
+
+  // Closing from a session row is reversible: the row leaves immediately and its PTY stops, while the
+  // provider session metadata and directory grant remain until the toast closes without being undone.
+  function closeSession(session: Session) {
+    const index = sessions.findIndex((item) => item.id === session.id);
+    const wasSelected = selectedId === session.id;
+    const nextSelectedId = sessions.find((item) => item.id !== session.id)?.id ?? "";
+    const runId = runs.current.get(session.id);
+    runs.current.delete(session.id);
+    if (resumed.current === session.id) resumed.current = "";
+    const timer = workTimers.current.get(session.id);
+    if (timer) window.clearTimeout(timer);
+    workTimers.current.delete(session.id);
+    setWorking((current) => {
+      const next = new Set(current);
+      next.delete(session.id);
+      return next;
+    });
+    setSessions((current) => current.filter((item) => item.id !== session.id));
+    if (wasSelected) setSelectedId(nextSelectedId);
+
+    let undone = false;
+    let toastId = "";
+    function restore(running: boolean) {
+      setSessions((current) => {
+        if (current.some((item) => item.id === session.id)) return current;
+        const restored = [...current];
+        restored.splice(Math.min(index, restored.length), 0, { ...session, running });
+        return restored;
+      });
+      if (wasSelected) setSelectedId((current) => (current === nextSelectedId ? session.id : current));
+    }
+    const stopped = invoke("stop_session", { sessionId: session.id }).then(
+      () => true,
+      (reason) => {
+        undone = true;
+        if (runId) {
+          runs.current.set(session.id, runId);
+          resumed.current = session.id;
+        }
+        restore(session.running);
+        setError(`Session could not be closed: ${String(reason)}`);
+        toast.close(toastId);
+        return false;
+      },
+    );
+    toastId = toast.add({
+      title: `Closed “${session.name}”`,
+      type: "success",
+      timeout: 8000,
+      onClose: async () => {
+        if (!undone && (await stopped)) await cleanupSession(session);
+      },
+      actionProps: {
+        children: "Undo",
+        onClick: async () => {
+          undone = true;
+          if (await stopped) restore(false);
+        },
+      },
+    });
   }
 
   async function checkForUpdates() {
@@ -1307,9 +1376,9 @@ function App() {
           if (shut.sidebar) glide(sidebarPanel.current, share(sidebarPanel.current, SIDES.sidebar.size));
         }}
         onRestartSession={(session) => void restartSession(session)}
-        onCloseSession={setClosing}
+        onCloseSession={closeSession}
         onRestartAll={() => void restartAllSessions()}
-        onCloseAll={() => setClosing("all")}
+        onCloseAll={() => setClosingAll(true)}
       >
         <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
           {/* The window buttons sit inside this bar on macOS, so it doubles as the title bar and drags the window. */}
@@ -1535,7 +1604,7 @@ function App() {
                             }
                             onRenamingChange={(renaming) => setRenamingId(renaming ? session.id : "")}
                             onRestart={() => void restartSession(session)}
-                            onClose={() => setClosing(session)}
+                            onClose={() => closeSession(session)}
                           />
                         ))}
                       </div>
@@ -1766,38 +1835,44 @@ function App() {
               ) : null}
             </DialogContent>
           </Dialog>
-          <Dialog open={Boolean(closing)} onOpenChange={(open) => !open && setClosing(undefined)}>
+          <Dialog open={closingAll} onOpenChange={setClosingAll}>
             <DialogContent>
               <DialogHeader>
-                <DialogTitle>{closing === "all" ? "Close all sessions?" : `Close ${closing?.name}?`}</DialogTitle>
+                <DialogTitle>Close all sessions?</DialogTitle>
                 <DialogDescription>
-                  {closing === "all"
-                    ? "This stops every running session and removes all tabs. Providers keep their own conversation history."
-                    : closing?.running
-                      ? "This stops the running session and removes the tab. The provider keeps its own conversation history."
-                      : "This removes the tab. The provider keeps its own conversation history."}
+                  This stops every running session and removes all tabs. Providers keep their own conversation history.
                 </DialogDescription>
               </DialogHeader>
               <DialogFooter>
-                <Button variant="outline" onClick={() => setClosing(undefined)}>
+                <Button variant="outline" onClick={() => setClosingAll(false)}>
                   Keep
                 </Button>
                 <Button
                   variant="destructive"
                   onClick={() => {
-                    if (closing === "all") {
-                      void Promise.all(sessions.map(closeSession)).then(() => setSelectedId(""));
-                    } else if (closing) void closeSession(closing);
-                    setClosing(undefined);
+                    void Promise.all(
+                      sessions.map(async (session) => {
+                        runs.current.delete(session.id);
+                        await invoke("stop_session", { sessionId: session.id });
+                        await cleanupSession(session);
+                        setSessions((current) => current.filter((item) => item.id !== session.id));
+                        if (selectedId === session.id)
+                          setSelectedId(sessions.find((item) => item.id !== session.id)?.id ?? "");
+                      }),
+                    ).then(() => {
+                      setSelectedId("");
+                    });
+                    setClosingAll(false);
                   }}
                 >
-                  {closing === "all" ? "Close all sessions" : "Close session"}
+                  Close all sessions
                 </Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
           <NewSessionDialog open={newSessionOpen} onOpenChange={setNewSessionOpen} onCreate={createSession} />
           <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} onSignIn={signIn} />
+          <Toaster />
         </div>
       </AppContextMenu>
     </TooltipProvider>
