@@ -49,6 +49,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Item, ItemActions, ItemMedia } from "@/components/ui/item";
+import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import {
   type PanelImperativeHandle,
   ResizableHandle,
@@ -512,6 +513,7 @@ function App() {
   const [updateOpen, setUpdateOpen] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("checking");
   const [availableVersion, setAvailableVersion] = useState("");
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [updateError, setUpdateError] = useState("");
   const runs = useRef(new Map<string, string>());
   const workTimers = useRef(new Map<string, number>());
@@ -925,12 +927,19 @@ function App() {
   }
 
   async function installUpdate() {
+    setUpdateProgress(null);
     setUpdateStatus("installing");
+    // A download only reports itself while it is running, so it is heard for exactly that long. A
+    // successful install restarts Lite from underneath this, and the failures it can return come
+    // back here to be shown.
+    const stop = await listen<number>("update-progress", ({ payload }) => setUpdateProgress(payload));
     try {
       await invoke("install_update");
     } catch (reason) {
       setUpdateError(String(reason));
       setUpdateStatus("error");
+    } finally {
+      stop();
     }
   }
 
@@ -1309,7 +1318,15 @@ function App() {
               </DialogDescription>
             </DialogHeader>
             <DialogBody>
-              {updateStatus === "checking" || updateStatus === "installing" ? (
+              {/* A bar only once the download has a percent to put in it: an update whose size the
+                  server never gave has none to give, and an empty bar would say less than the spinner
+                  it replaced. */}
+              {updateStatus === "installing" && updateProgress !== null ? (
+                <Progress value={updateProgress}>
+                  <ProgressLabel>Downloading update</ProgressLabel>
+                  <ProgressValue />
+                </Progress>
+              ) : updateStatus === "checking" || updateStatus === "installing" ? (
                 <Spinner className="mx-auto size-5 text-muted-foreground" />
               ) : (
                 // What this copy of Lite actually is, which is the first thing worth knowing when it and
