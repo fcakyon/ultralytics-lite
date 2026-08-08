@@ -8,25 +8,53 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  ClipboardPaste,
+  Copy,
+  ExternalLink,
   GitBranch,
   KeyRound,
+  Link,
   Moon,
   MoreHorizontal,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
   RotateCcw,
+  Scissors,
   Search,
   SquareTerminal,
   Sun,
+  TextSelect,
   Trash2,
   X,
 } from "lucide-react";
-import { Component, lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Component,
+  lazy,
+  type ReactElement,
+  type ReactNode,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { LiteLogomark, ProviderIcon } from "@/brand-icons";
 import { Badge } from "@/components/ui/badge";
 import { ActionIconButton, Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuShortcut,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import {
   Dialog,
   DialogBody,
@@ -140,17 +168,331 @@ const RELEASE_NOTE = {
 
 type UpdateStatus = "checking" | "available" | "rebuild" | "current" | "installing" | "error";
 
+type Editable = HTMLInputElement | HTMLTextAreaElement | HTMLElement;
+type AppMenuContext = {
+  collapseFiles: HTMLButtonElement | null;
+  collapsePanel: HTMLButtonElement | null;
+  collapseSessions: HTMLButtonElement | null;
+  directory: HTMLButtonElement | null;
+  editable: Editable | null;
+  expandFiles: HTMLButtonElement | null;
+  expandPanel: HTMLButtonElement | null;
+  expandSessions: HTMLButtonElement | null;
+  newSession: HTMLButtonElement | null;
+  refresh: HTMLButtonElement | null;
+  selectedText: string;
+  sessionId: string;
+  url: string;
+  value: string;
+  valueLabel: string;
+};
+
+const EMPTY_MENU_CONTEXT: AppMenuContext = {
+  collapseFiles: null,
+  collapsePanel: null,
+  collapseSessions: null,
+  directory: null,
+  editable: null,
+  expandFiles: null,
+  expandPanel: null,
+  expandSessions: null,
+  newSession: null,
+  refresh: null,
+  selectedText: "",
+  sessionId: "",
+  url: "",
+  value: "",
+  valueLabel: "",
+};
+
+function inputSelection(element: HTMLInputElement | HTMLTextAreaElement): string {
+  const start = element.selectionStart ?? 0;
+  const end = element.selectionEnd ?? 0;
+  return element.value.slice(start, end);
+}
+
+function menuContext(target: EventTarget | null): AppMenuContext {
+  if (!(target instanceof Element)) return EMPTY_MENU_CONTEXT;
+  const editable = target.closest<HTMLElement>("input, textarea, [contenteditable=true]");
+  const link = target.closest<HTMLElement>("a[href], [data-context-url]");
+  const value = target.closest<HTMLElement>("[data-context-value]");
+  const directory = target.closest<HTMLButtonElement>("[data-context-directory]");
+  const session = target.closest<HTMLElement>("[data-context-session]");
+  const surface = session ? null : target.closest<HTMLElement>("[data-context-surface]");
+  const files = target.closest<HTMLElement>("[data-context-files]");
+  const selectedText =
+    editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement
+      ? inputSelection(editable)
+      : (window.getSelection()?.toString() ?? "");
+  return {
+    collapseFiles: files?.querySelector<HTMLButtonElement>("[data-context-collapse-files]") ?? null,
+    collapsePanel: surface?.querySelector<HTMLButtonElement>("[data-context-collapse-panel]") ?? null,
+    collapseSessions: surface?.querySelector<HTMLButtonElement>("[data-context-collapse-sessions]") ?? null,
+    directory,
+    editable,
+    expandFiles: files?.querySelector<HTMLButtonElement>("[data-context-expand-files]") ?? null,
+    expandPanel: surface?.querySelector<HTMLButtonElement>("[data-context-expand-panel]") ?? null,
+    expandSessions: surface?.querySelector<HTMLButtonElement>("[data-context-expand-sessions]") ?? null,
+    newSession: surface?.querySelector<HTMLButtonElement>("[data-context-new-session]") ?? null,
+    refresh: surface?.querySelector<HTMLButtonElement>("[data-context-refresh]") ?? null,
+    selectedText,
+    sessionId: session?.dataset.contextSession ?? "",
+    url: link instanceof HTMLAnchorElement ? link.href : (link?.dataset.contextUrl ?? ""),
+    value: value?.dataset.contextValue ?? "",
+    valueLabel: value?.dataset.contextLabel ?? "Copy",
+  };
+}
+
+function hasMenuItems(context: AppMenuContext): boolean {
+  return [
+    context.collapseFiles || context.collapsePanel || context.collapseSessions,
+    context.editable,
+    context.directory || context.expandFiles || context.expandPanel || context.expandSessions,
+    context.newSession || context.refresh,
+    context.selectedText,
+    context.sessionId,
+    context.url || context.value,
+  ].some(Boolean);
+}
+
+function writeClipboard(text: string) {
+  void navigator.clipboard.writeText(text).catch(() => undefined);
+}
+
+function edit(context: AppMenuContext, command: "cut" | "paste" | "selectAll") {
+  const element = context.editable;
+  if (!element) return;
+  element.focus();
+  if (document.execCommand(command)) return;
+  if (command !== "paste") return;
+  void navigator.clipboard
+    .readText()
+    .then((text) => {
+      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+        element.setRangeText(text, element.selectionStart ?? 0, element.selectionEnd ?? 0, "end");
+        element.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertFromPaste" }));
+      } else document.execCommand("insertText", false, text);
+    })
+    .catch(() => undefined);
+}
+
+function AppContextMenu({
+  children,
+  sessions,
+  selectedId,
+  startingIds,
+  onSelectSession,
+  onRenameSession,
+  onRestartSession,
+  onCloseSession,
+  onRestartAll,
+  onCloseAll,
+}: {
+  children: ReactElement;
+  sessions: Session[];
+  selectedId: string;
+  startingIds: Set<string>;
+  onSelectSession: (session: Session) => void;
+  onRenameSession: (session: Session) => void;
+  onRestartSession: (session: Session) => void;
+  onCloseSession: (session: Session) => void;
+  onRestartAll: () => void;
+  onCloseAll: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [context, setContext] = useState(EMPTY_MENU_CONTEXT);
+  const shortcut = navigator.platform.includes("Mac") ? "⌘" : "Ctrl+";
+  const readonly =
+    context.editable instanceof HTMLInputElement || context.editable instanceof HTMLTextAreaElement
+      ? context.editable.readOnly || context.editable.disabled
+      : false;
+  const session = sessions.find((item) => item.id === context.sessionId);
+  const linkGroup = Boolean(context.url || context.value);
+  const surfaceGroup = [
+    context.collapseFiles || context.collapsePanel || context.collapseSessions,
+    context.expandFiles || context.expandPanel || context.expandSessions,
+    context.newSession || context.refresh,
+  ].some(Boolean);
+  const editGroup = Boolean(context.editable || context.selectedText);
+  const sessionsGroup = Boolean(session || context.newSession);
+
+  return (
+    <ContextMenu
+      open={open}
+      onOpenChange={(next, details) => {
+        if (!next) return setOpen(false);
+        const nextContext = menuContext(details.event.target);
+        setContext(nextContext);
+        setOpen(hasMenuItems(nextContext));
+      }}
+    >
+      <ContextMenuTrigger render={children} />
+      <ContextMenuContent className="w-44">
+        {session ? (
+          <>
+            {session.id !== selectedId || !session.running ? (
+              <ContextMenuItem onClick={() => onSelectSession(session)}>
+                <Play />
+                {session.running ? "Open session" : "Resume session"}
+              </ContextMenuItem>
+            ) : null}
+            <ContextMenuItem onClick={() => onRenameSession(session)}>
+              <Pencil />
+              Rename
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => writeClipboard(session.cwd)}>
+              <Copy />
+              Copy path
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem disabled={startingIds.has(session.id)} onClick={() => onRestartSession(session)}>
+              <RotateCcw />
+              Restart
+            </ContextMenuItem>
+            <ContextMenuItem
+              variant="destructive"
+              disabled={startingIds.has(session.id)}
+              onClick={() => onCloseSession(session)}
+            >
+              <Trash2 />
+              Close session
+            </ContextMenuItem>
+          </>
+        ) : null}
+        {context.url ? (
+          <>
+            <ContextMenuItem onClick={() => void invoke("open_url", { url: context.url })}>
+              <ExternalLink />
+              Open link
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => writeClipboard(context.url)}>
+              <Link />
+              Copy link
+            </ContextMenuItem>
+          </>
+        ) : null}
+        {context.directory ? (
+          <ContextMenuItem onClick={() => context.directory?.click()}>
+            <ChevronRight className={context.directory.dataset.contextExpanded === "true" ? "rotate-90" : undefined} />
+            {context.directory.dataset.contextExpanded === "true" ? "Collapse folder" : "Expand folder"}
+          </ContextMenuItem>
+        ) : null}
+        {context.value ? (
+          <ContextMenuItem onClick={() => writeClipboard(context.value)}>
+            <Copy />
+            {context.valueLabel}
+          </ContextMenuItem>
+        ) : null}
+        {linkGroup && surfaceGroup ? <ContextMenuSeparator /> : null}
+        {context.refresh ? (
+          <ContextMenuItem onClick={() => context.refresh?.click()}>
+            <RefreshCw />
+            Refresh
+          </ContextMenuItem>
+        ) : null}
+        {context.expandFiles ? (
+          <ContextMenuItem disabled={context.expandFiles.disabled} onClick={() => context.expandFiles?.click()}>
+            <ChevronsUpDown />
+            Expand all
+          </ContextMenuItem>
+        ) : null}
+        {context.collapseFiles ? (
+          <ContextMenuItem disabled={context.collapseFiles.disabled} onClick={() => context.collapseFiles?.click()}>
+            <ChevronsDownUp />
+            Collapse all
+          </ContextMenuItem>
+        ) : null}
+        {context.newSession ? (
+          <ContextMenuItem onClick={() => context.newSession?.click()}>
+            <Plus />
+            New session
+          </ContextMenuItem>
+        ) : null}
+        {context.expandSessions ? (
+          <ContextMenuItem onClick={() => context.expandSessions?.click()}>
+            <ChevronRight />
+            Expand sessions
+          </ContextMenuItem>
+        ) : null}
+        {context.collapseSessions ? (
+          <ContextMenuItem onClick={() => context.collapseSessions?.click()}>
+            <ChevronLeft />
+            Collapse sessions
+          </ContextMenuItem>
+        ) : null}
+        {context.expandPanel ? (
+          <ContextMenuItem onClick={() => context.expandPanel?.click()}>
+            <ChevronLeft />
+            Expand panel
+          </ContextMenuItem>
+        ) : null}
+        {context.collapsePanel ? (
+          <ContextMenuItem onClick={() => context.collapsePanel?.click()}>
+            <ChevronRight />
+            Collapse panel
+          </ContextMenuItem>
+        ) : null}
+        {sessionsGroup && sessions.length ? (
+          <>
+            <ContextMenuSeparator />
+            <ContextMenuItem disabled={startingIds.size > 0} onClick={onRestartAll}>
+              <RotateCcw />
+              Restart all
+            </ContextMenuItem>
+            <ContextMenuItem variant="destructive" disabled={startingIds.size > 0} onClick={onCloseAll}>
+              <Trash2 />
+              Close all sessions
+            </ContextMenuItem>
+          </>
+        ) : null}
+        {(linkGroup || surfaceGroup || sessionsGroup) && editGroup ? <ContextMenuSeparator /> : null}
+        {context.editable ? (
+          <>
+            <ContextMenuItem disabled={!context.selectedText || readonly} onClick={() => edit(context, "cut")}>
+              <Scissors />
+              Cut
+              <ContextMenuShortcut>{shortcut}X</ContextMenuShortcut>
+            </ContextMenuItem>
+            <ContextMenuItem disabled={!context.selectedText} onClick={() => writeClipboard(context.selectedText)}>
+              <Copy />
+              Copy
+              <ContextMenuShortcut>{shortcut}C</ContextMenuShortcut>
+            </ContextMenuItem>
+            <ContextMenuItem disabled={readonly} onClick={() => edit(context, "paste")}>
+              <ClipboardPaste />
+              Paste
+              <ContextMenuShortcut>{shortcut}V</ContextMenuShortcut>
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem onClick={() => edit(context, "selectAll")}>
+              <TextSelect />
+              Select all
+              <ContextMenuShortcut>{shortcut}A</ContextMenuShortcut>
+            </ContextMenuItem>
+          </>
+        ) : context.selectedText ? (
+          <ContextMenuItem onClick={() => writeClipboard(context.selectedText)}>
+            <Copy />
+            Copy
+            <ContextMenuShortcut>{shortcut}C</ContextMenuShortcut>
+          </ContextMenuItem>
+        ) : null}
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+}
+
 // How long a session has to stay quiet before it counts as connected but idle rather than working.
 // Long enough that the gaps between an agent's own writes do not flicker the dot.
 const QUIET_MS = 1200;
 
 // Three states the sidebar dot tells apart: the terminal is gone, it is up and quiet, or it is up and
-// producing output. Each gets its own color, so the state survives a display where the pulse is
-// suppressed and the motion only reinforces what green already says.
+// producing output. Each reuses a badge token, so the state survives a display where motion is
+// suppressed and the palette stays consistent with the rest of the interface.
 const SESSION_STATUS = {
   disconnected: { dot: "bg-muted-foreground/40", label: "Disconnected" },
-  idle: { dot: "bg-emerald-500", label: "Connected, idle" },
-  working: { dot: "bg-blue-500 animate-pulse motion-reduce:animate-none", label: "Connected, working" },
+  idle: { dot: "bg-success", label: "Connected, idle" },
+  working: { dot: "bg-primary animate-pulse motion-reduce:animate-none", label: "Connected, working" },
 } as const;
 
 // A local build names its commit and is red, so it is never mistaken for the installed copy.
@@ -279,18 +621,11 @@ function SessionBadge({
   );
 }
 
-// The provider's own mark, at the size a page can be about rather than the size a row can carry. It is
-// the same mark the sidebar tile and the agent chooser wear, so a session looks like itself wherever it
-// is met; here it is what the empty terminal is waiting on, so it is the thing worth looking at. While
-// a session is still coming up the mark keeps a turning ring, which says starting without adding a
-// second object to the page for the eye to land on.
-function SessionMark({ session, busy = false }: { session: Session; busy?: boolean }) {
+// The provider's own mark, at the size a page can be about rather than the size a row can carry.
+function SessionMark({ session }: { session: Session }) {
   return (
-    <EmptyMedia variant="icon" className="relative size-14 rounded-2xl">
-      <ProviderIcon agent={session.agent} provider={session.provider} className="size-7" />
-      {busy ? (
-        <Spinner className="absolute -inset-1 size-auto text-muted-foreground/40" strokeWidth={1} aria-hidden="true" />
-      ) : null}
+    <EmptyMedia variant="icon" className="size-16 rounded-2xl">
+      <ProviderIcon agent={session.agent} provider={session.provider} className="size-8" />
     </EmptyMedia>
   );
 }
@@ -300,8 +635,10 @@ function SessionRow({
   active,
   starting,
   working,
+  renaming,
   onSelect,
   onRename,
+  onRenamingChange,
   onRestart,
   onClose,
 }: {
@@ -309,23 +646,25 @@ function SessionRow({
   active: boolean;
   starting: boolean;
   working: boolean;
+  renaming: boolean;
   onSelect: () => void;
   onRename: (name: string) => void;
+  onRenamingChange: (renaming: boolean) => void;
   onRestart: () => void;
   onClose: () => void;
 }) {
-  const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(session.name);
 
   function saveName() {
     const next = name.trim();
     if (next) onRename(next);
     else setName(session.name);
-    setRenaming(false);
+    onRenamingChange(false);
   }
 
   return (
     <Item
+      data-context-session={session.id}
       size="xs"
       // Never wrapped: Item wraps by default, and a row narrow enough to push the buttons onto a second
       // line takes the tooltip's anchor out from under the pointer that opened it.
@@ -346,7 +685,7 @@ function SessionRow({
             if (event.key === "Enter") saveName();
             if (event.key === "Escape") {
               setName(session.name);
-              setRenaming(false);
+              onRenamingChange(false);
             }
           }}
         />
@@ -357,8 +696,8 @@ function SessionRow({
         <button
           type="button"
           className="min-w-0 flex-1 text-left"
-          onClick={() => (active && session.running ? setRenaming(true) : onSelect())}
-          onDoubleClick={() => setRenaming(true)}
+          onClick={() => (active && session.running ? onRenamingChange(true) : onSelect())}
+          onDoubleClick={() => onRenamingChange(true)}
           title={session.cwd}
         >
           <span className="block truncate text-xs font-medium">{session.name}</span>
@@ -367,8 +706,7 @@ function SessionRow({
           </span>
         </button>
       )}
-      {/* Hidden rather than transparent, so a name gets the whole row until the pointer arrives. */}
-      <ItemActions className="hidden shrink-0 gap-0.5 group-hover/item:flex group-focus-within/item:flex">
+      <ItemActions className="shrink-0 gap-0.5 opacity-0 group-hover/item:opacity-100 group-focus-within/item:opacity-100">
         <ActionIconButton
           size="icon-sm"
           tooltip="Restart"
@@ -485,13 +823,14 @@ function App() {
   const [selectedId, setSelectedId] = useState(() => sessions[0]?.id ?? "");
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [closing, setClosing] = useState<Session>();
+  const [closing, setClosing] = useState<Session | "all">();
   const [error, setError] = useState("");
   const [startingIds, setStartingIds] = useState<Set<string>>(new Set());
   // Sessions whose terminal has written something recently, which is what separates a connected
   // session that is working from one that is merely connected.
   const [working, setWorking] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
+  const [renamingId, setRenamingId] = useState("");
   // Each side collapses to a rail of icons rather than to nothing, so the panel is still there to click
   // or drag back open. Dragging past the minimum is what collapses it; the handle never goes away.
   const [shut, setShut] = useState({ sidebar: false, inspector: false });
@@ -841,7 +1180,7 @@ function App() {
 
   // Restarting keeps the tab and its folder but asks the provider for a conversation of its own, so the
   // session it resumed by id is forgotten first and the tab takes a new one.
-  async function restartSession(session: Session) {
+  async function restartSession(session: Session, select = true) {
     runs.current.delete(session.id);
     setSessions((current) => current.map((item) => (item.id === session.id ? { ...item, running: false } : item)));
     await invoke("stop_session", { sessionId: session.id });
@@ -853,10 +1192,16 @@ function App() {
     clearOutput(session.id);
     const fresh: Session = { ...session, id: crypto.randomUUID(), providerSessionId: undefined, running: false };
     setSessions((current) => current.map((item) => (item.id === session.id ? fresh : item)));
-    setSelectedId(fresh.id);
-    resumed.current = fresh.id;
+    if (select) {
+      setSelectedId(fresh.id);
+      resumed.current = fresh.id;
+    }
     await launch(fresh, false);
     if (fresh.agent === "kimi") startKimiConversation(fresh.id);
+  }
+
+  async function restartAllSessions() {
+    await Promise.all(sessions.map((session) => restartSession(session, session.id === selectedId)));
   }
 
   async function closeSession(session: Session) {
@@ -951,473 +1296,510 @@ function App() {
 
   return (
     <TooltipProvider>
-      <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
-        {/* The window buttons sit inside this bar on macOS, so it doubles as the title bar and drags the window. */}
-        <header
-          data-tauri-drag-region
-          className="flex h-9 shrink-0 items-center gap-2 border-b bg-sidebar px-3 text-sidebar-foreground in-data-[titlebar=overlay]:pl-[86px]"
-        >
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <button
-                  type="button"
-                  className="shrink-0"
-                  aria-label="Lite on GitHub"
-                  onClick={() => void invoke("open_url", { url: "https://github.com/ultralytics/lite" })}
-                />
-              }
-            >
-              <LiteLogomark className="size-5" />
-            </TooltipTrigger>
-            <TooltipContent>View Lite on GitHub</TooltipContent>
-          </Tooltip>
-          <VersionBadge
-            version={version}
-            commit={commit}
-            built={built}
-            release={release}
-            onCheck={() => void checkForUpdates()}
-          />
-          {selected ? (
-            <>
-              <Separator orientation="vertical" className="mx-1 h-4" />
-              <ProviderIcon agent={selected.agent} provider={selected.provider} />
-              <span className="min-w-0 truncate text-xs font-medium">{selected.name}</span>
-              <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{selected.cwd}</span>
-              {remote ? (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <button
-                        type="button"
-                        className="flex max-w-56 shrink-0 items-center gap-1.5 text-muted-foreground hover:text-foreground"
-                        onClick={() => void invoke("open_url", { url: remote })}
-                      />
-                    }
-                  >
-                    <GitBranch className="size-3.5 shrink-0" />
-                    <span className="truncate font-mono text-[11px]">{repoName(remote)}</span>
-                  </TooltipTrigger>
-                  <TooltipContent>Open {remote}</TooltipContent>
-                </Tooltip>
-              ) : null}
-            </>
-          ) : (
-            <span className="text-sm font-semibold">Lite</span>
-          )}
-          <div className="ml-auto flex shrink-0 items-center gap-0.5">
+      <AppContextMenu
+        sessions={sessions}
+        selectedId={selectedId}
+        startingIds={startingIds}
+        onSelectSession={(session) => openRef.current(session)}
+        onRenameSession={(session) => {
+          openRef.current(session);
+          setRenamingId(session.id);
+          if (shut.sidebar) glide(sidebarPanel.current, share(sidebarPanel.current, SIDES.sidebar.size));
+        }}
+        onRestartSession={(session) => void restartSession(session)}
+        onCloseSession={setClosing}
+        onRestartAll={() => void restartAllSessions()}
+        onCloseAll={() => setClosing("all")}
+      >
+        <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
+          {/* The window buttons sit inside this bar on macOS, so it doubles as the title bar and drags the window. */}
+          <header
+            data-tauri-drag-region
+            className="flex h-9 shrink-0 items-center gap-2 border-b bg-sidebar px-3 text-sidebar-foreground in-data-[titlebar=overlay]:pl-[86px]"
+          >
             <Tooltip>
               <TooltipTrigger
                 render={
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    className="relative"
-                    onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-                    aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+                  <button
+                    type="button"
+                    className="shrink-0"
+                    aria-label="Lite on GitHub"
+                    data-context-url="https://github.com/ultralytics/lite"
+                    onClick={() => void invoke("open_url", { url: "https://github.com/ultralytics/lite" })}
                   />
                 }
               >
-                <Sun className="size-4 rotate-0 scale-100 transition-transform motion-reduce:transition-none dark:-rotate-90 dark:scale-0" />
-                <Moon className="absolute size-4 rotate-90 scale-0 transition-transform motion-reduce:transition-none dark:rotate-0 dark:scale-100" />
+                <LiteLogomark className="size-5" />
               </TooltipTrigger>
-              <TooltipContent>{theme === "dark" ? "Light mode" : "Dark mode"}</TooltipContent>
+              <TooltipContent>View Lite on GitHub</TooltipContent>
             </Tooltip>
-            <DropdownMenu>
+            <VersionBadge
+              version={version}
+              commit={commit}
+              built={built}
+              release={release}
+              onCheck={() => void checkForUpdates()}
+            />
+            {selected ? (
+              <>
+                <Separator orientation="vertical" className="mx-1 h-4" />
+                <ProviderIcon agent={selected.agent} provider={selected.provider} />
+                <span className="min-w-0 truncate text-xs font-medium">{selected.name}</span>
+                <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{selected.cwd}</span>
+                {remote ? (
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <button
+                          type="button"
+                          className="flex max-w-56 shrink-0 items-center gap-1.5 text-muted-foreground hover:text-foreground"
+                          data-context-url={remote}
+                          onClick={() => void invoke("open_url", { url: remote })}
+                        />
+                      }
+                    >
+                      <GitBranch className="size-3.5 shrink-0" />
+                      <span className="truncate font-mono text-[11px]">{repoName(remote)}</span>
+                    </TooltipTrigger>
+                    <TooltipContent>Open {remote}</TooltipContent>
+                  </Tooltip>
+                ) : null}
+              </>
+            ) : (
+              <span className="text-sm font-semibold">Lite</span>
+            )}
+            <div className="ml-auto flex shrink-0 items-center gap-0.5">
               <Tooltip>
                 <TooltipTrigger
                   render={
-                    <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Options" />} />
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="relative"
+                      onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+                      aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+                    />
                   }
                 >
-                  <MoreHorizontal />
+                  <Sun className="size-4 rotate-0 scale-100 transition-transform motion-reduce:transition-none dark:-rotate-90 dark:scale-0" />
+                  <Moon className="absolute size-4 rotate-90 scale-0 transition-transform motion-reduce:transition-none dark:rotate-0 dark:scale-100" />
                 </TooltipTrigger>
-                <TooltipContent>Options</TooltipContent>
+                <TooltipContent>{theme === "dark" ? "Light mode" : "Dark mode"}</TooltipContent>
               </Tooltip>
-              <DropdownMenuContent align="end" className="w-48">
-                {version ? (
-                  <DropdownMenuGroup>
-                    <DropdownMenuLabel>
-                      {commit ? `Lite ${version} · local ${commit}` : `Lite ${version}`}
-                    </DropdownMenuLabel>
-                    <DropdownMenuSeparator />
-                  </DropdownMenuGroup>
-                ) : null}
-                <DropdownMenuItem onClick={() => setSettingsOpen(true)}>
-                  <KeyRound />
-                  API keys
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => void checkForUpdates()}>
-                  <RefreshCw />
-                  Check for updates
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-        </header>
-        <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
-          <ResizablePanel
-            panelRef={sidebarPanel}
-            defaultSize={SIDES.sidebar.size}
-            minSize={RAIL}
-            maxSize={SIDES.sidebar.max}
-            onResize={(size) => rail("sidebar", size)}
-          >
-            <aside className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
-              {shut.sidebar ? (
-                <ScrollArea className="min-h-0 flex-1">
-                  <div className="flex animate-in flex-col items-center gap-0.5 py-1.5 fade-in duration-200">
-                    <ActionIconButton
-                      size="icon-sm"
-                      tooltip="Expand sessions"
-                      tooltipSide="right"
-                      aria-label="Expand sessions"
-                      onClick={() => glide(sidebarPanel.current, share(sidebarPanel.current, SIDES.sidebar.size))}
-                    >
-                      <ChevronRight />
-                    </ActionIconButton>
-                    <ActionIconButton
-                      size="icon-sm"
-                      tooltip="New session"
-                      tooltipSide="right"
-                      aria-label="New session"
-                      onClick={() => setNewSessionOpen(true)}
-                    >
-                      <Plus />
-                    </ActionIconButton>
-                    {sessions.map((session) => (
-                      <Tooltip key={session.id}>
-                        <TooltipTrigger
-                          render={
-                            <button
-                              type="button"
-                              aria-pressed={session.id === selectedId}
-                              className={`rounded-lg p-1 ${session.id === selectedId ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/60"}`}
-                              onClick={() => openRef.current(session)}
+              <DropdownMenu>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Options" />} />
+                    }
+                  >
+                    <MoreHorizontal />
+                  </TooltipTrigger>
+                  <TooltipContent>Options</TooltipContent>
+                </Tooltip>
+                <DropdownMenuContent align="end" className="w-48">
+                  {version ? (
+                    <DropdownMenuGroup>
+                      <DropdownMenuLabel>
+                        {commit ? `Lite ${version} · local ${commit}` : `Lite ${version}`}
+                      </DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                    </DropdownMenuGroup>
+                  ) : null}
+                  <DropdownMenuItem onClick={() => setSettingsOpen(true)}>
+                    <KeyRound />
+                    API keys
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => void checkForUpdates()}>
+                    <RefreshCw />
+                    Check for updates
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </header>
+          <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
+            <ResizablePanel
+              panelRef={sidebarPanel}
+              defaultSize={SIDES.sidebar.size}
+              minSize={RAIL}
+              maxSize={SIDES.sidebar.max}
+              onResize={(size) => rail("sidebar", size)}
+            >
+              <aside data-context-surface className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
+                {shut.sidebar ? (
+                  <ScrollArea className="min-h-0 flex-1">
+                    <div className="flex animate-in flex-col items-center gap-0.5 py-1.5 fade-in duration-200">
+                      <ActionIconButton
+                        size="icon-sm"
+                        tooltip="Expand sessions"
+                        tooltipSide="right"
+                        aria-label="Expand sessions"
+                        data-context-expand-sessions
+                        onClick={() => glide(sidebarPanel.current, share(sidebarPanel.current, SIDES.sidebar.size))}
+                      >
+                        <ChevronRight />
+                      </ActionIconButton>
+                      <ActionIconButton
+                        size="icon-sm"
+                        tooltip="New session"
+                        tooltipSide="right"
+                        aria-label="New session"
+                        data-context-new-session
+                        onClick={() => setNewSessionOpen(true)}
+                      >
+                        <Plus />
+                      </ActionIconButton>
+                      {sessions.map((session) => (
+                        <Tooltip key={session.id}>
+                          <TooltipTrigger
+                            render={
+                              <button
+                                type="button"
+                                aria-pressed={session.id === selectedId}
+                                data-context-session={session.id}
+                                className={`rounded-lg p-1 ${session.id === selectedId ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/60"}`}
+                                onClick={() => openRef.current(session)}
+                              />
+                            }
+                          >
+                            <SessionBadge
+                              session={session}
+                              active={session.id === selectedId}
+                              starting={startingIds.has(session.id)}
+                              working={working.has(session.id)}
                             />
-                          }
-                        >
-                          <SessionBadge
+                          </TooltipTrigger>
+                          <TooltipContent side="right">{session.name}</TooltipContent>
+                        </Tooltip>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                ) : (
+                  <>
+                    {/* The search field names the panel and searches it, so the list keeps the row a title would cost. */}
+                    <div className="flex h-11 shrink-0 items-center gap-0.5 pr-1.5 pl-2">
+                      <InputGroup>
+                        <InputGroupAddon>
+                          <Search />
+                        </InputGroupAddon>
+                        <InputGroupInput
+                          value={query}
+                          placeholder="Search sessions"
+                          aria-label="Search sessions"
+                          onChange={(event) => setQuery(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Escape") setQuery("");
+                          }}
+                        />
+                      </InputGroup>
+                      <ActionIconButton
+                        size="icon-sm"
+                        tooltip="New session"
+                        aria-label="New session"
+                        data-context-new-session
+                        onClick={() => setNewSessionOpen(true)}
+                      >
+                        <Plus />
+                      </ActionIconButton>
+                      <ActionIconButton
+                        size="icon-sm"
+                        tooltip="Collapse sessions"
+                        aria-label="Collapse sessions"
+                        data-context-collapse-sessions
+                        onClick={() => glide(sidebarPanel.current, RAIL)}
+                      >
+                        <ChevronLeft />
+                      </ActionIconButton>
+                    </div>
+                    <ScrollArea className="min-h-0 flex-1">
+                      <div className="space-y-0.5 px-2 pb-2">
+                        {query && !visible.length ? (
+                          <p className="px-2 py-1.5 text-xs text-muted-foreground">No session matches “{query}”.</p>
+                        ) : null}
+                        {visible.map((session) => (
+                          <SessionRow
+                            key={session.id}
                             session={session}
                             active={session.id === selectedId}
                             starting={startingIds.has(session.id)}
                             working={working.has(session.id)}
+                            renaming={renamingId === session.id}
+                            onSelect={() => openRef.current(session)}
+                            onRename={(name) =>
+                              setSessions((current) =>
+                                current.map((item) =>
+                                  item.id === session.id ? { ...item, name, renamed: true } : item,
+                                ),
+                              )
+                            }
+                            onRenamingChange={(renaming) => setRenamingId(renaming ? session.id : "")}
+                            onRestart={() => void restartSession(session)}
+                            onClose={() => setClosing(session)}
                           />
-                        </TooltipTrigger>
-                        <TooltipContent side="right">{session.name}</TooltipContent>
-                      </Tooltip>
-                    ))}
-                  </div>
-                </ScrollArea>
-              ) : (
-                <>
-                  {/* The search field names the panel and searches it, so the list keeps the row a title would cost. */}
-                  <div className="flex h-11 shrink-0 items-center gap-0.5 pr-1.5 pl-2">
-                    <InputGroup>
-                      <InputGroupAddon>
-                        <Search />
-                      </InputGroupAddon>
-                      <InputGroupInput
-                        value={query}
-                        placeholder="Search sessions"
-                        aria-label="Search sessions"
-                        onChange={(event) => setQuery(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Escape") setQuery("");
-                        }}
-                      />
-                    </InputGroup>
-                    <ActionIconButton
-                      size="icon-sm"
-                      tooltip="New session"
-                      aria-label="New session"
-                      onClick={() => setNewSessionOpen(true)}
-                    >
-                      <Plus />
-                    </ActionIconButton>
-                    <ActionIconButton
-                      size="icon-sm"
-                      tooltip="Collapse sessions"
-                      aria-label="Collapse sessions"
-                      onClick={() => glide(sidebarPanel.current, RAIL)}
-                    >
-                      <ChevronLeft />
-                    </ActionIconButton>
-                  </div>
-                  <ScrollArea className="min-h-0 flex-1">
-                    <div className="space-y-0.5 px-2 pb-2">
-                      {query && !visible.length ? (
-                        <p className="px-2 py-1.5 text-xs text-muted-foreground">No session matches “{query}”.</p>
-                      ) : null}
-                      {visible.map((session) => (
-                        <SessionRow
-                          key={session.id}
-                          session={session}
-                          active={session.id === selectedId}
-                          starting={startingIds.has(session.id)}
-                          working={working.has(session.id)}
-                          onSelect={() => openRef.current(session)}
-                          onRename={(name) =>
+                        ))}
+                      </div>
+                    </ScrollArea>
+                  </>
+                )}
+              </aside>
+            </ResizablePanel>
+            <ResizableHandle withHandle />
+            <ResizablePanel defaultSize="55%" minSize="38%">
+              <section className="flex h-full min-w-0 flex-col">
+                {selected ? (
+                  <div className="min-h-0 flex-1">
+                    {selected.running ? (
+                      <Suspense fallback={<div className="h-full bg-background" />}>
+                        <TerminalView
+                          sessionId={selected.id}
+                          theme={theme}
+                          onPrompt={(text) =>
                             setSessions((current) =>
-                              current.map((item) => (item.id === session.id ? { ...item, name, renamed: true } : item)),
+                              current.map((item) =>
+                                item.id === selected.id && !item.renamed && item.name === folderName(item.cwd)
+                                  ? { ...item, name: subject(text) }
+                                  : item,
+                              ),
                             )
                           }
-                          onRestart={() => void restartSession(session)}
-                          onClose={() => setClosing(session)}
                         />
-                      ))}
-                    </div>
-                  </ScrollArea>
-                </>
-              )}
-            </aside>
-          </ResizablePanel>
-          <ResizableHandle withHandle />
-          <ResizablePanel defaultSize="55%" minSize="38%">
-            <section className="flex h-full min-w-0 flex-col">
-              {selected ? (
-                <div className="min-h-0 flex-1">
-                  {selected.running ? (
-                    <Suspense fallback={<div className="h-full bg-background" />}>
-                      <TerminalView
-                        sessionId={selected.id}
-                        theme={theme}
-                        onPrompt={(text) =>
-                          setSessions((current) =>
-                            current.map((item) =>
-                              item.id === selected.id && !item.renamed && item.name === folderName(item.cwd)
-                                ? { ...item, name: subject(text) }
-                                : item,
-                            ),
-                          )
-                        }
-                      />
-                    </Suspense>
-                  ) : startingIds.has(selected.id) ? (
-                    <Empty className="h-full">
-                      <EmptyHeader>
-                        <SessionMark session={selected} busy />
-                        <EmptyTitle>Starting {sessionLabel(selected)}…</EmptyTitle>
-                        <EmptyDescription>{shortPath(selected.cwd)}</EmptyDescription>
-                      </EmptyHeader>
-                    </Empty>
-                  ) : (
-                    <Empty className="h-full">
-                      <EmptyHeader>
-                        <SessionMark session={selected} />
-                        <EmptyTitle>This session is not running</EmptyTitle>
-                        <EmptyDescription>Resuming reopens it in the folder it was started in.</EmptyDescription>
-                      </EmptyHeader>
-                      <EmptyContent>
-                        <Button variant="outline" onClick={() => void launch(selected, true)}>
-                          <Play />
-                          Resume session
-                        </Button>
-                      </EmptyContent>
-                    </Empty>
-                  )}
-                </div>
-              ) : (
-                <Empty className="h-full">
-                  <EmptyHeader>
-                    <EmptyMedia variant="icon">
-                      <SquareTerminal />
-                    </EmptyMedia>
-                    <EmptyTitle>Start a session</EmptyTitle>
-                    <EmptyDescription>
-                      Pick a project folder, then choose the agent that should work in it.
-                    </EmptyDescription>
-                  </EmptyHeader>
-                  <EmptyContent>
-                    <Button onClick={() => setNewSessionOpen(true)}>
-                      <Plus />
-                      New session
+                      </Suspense>
+                    ) : startingIds.has(selected.id) ? (
+                      <Empty className="h-full">
+                        <EmptyHeader>
+                          <SessionMark session={selected} />
+                          <EmptyTitle className="flex items-center gap-2">
+                            <Spinner className="size-4 text-muted-foreground" aria-hidden="true" />
+                            Starting {sessionLabel(selected)}…
+                          </EmptyTitle>
+                          <EmptyDescription>{shortPath(selected.cwd)}</EmptyDescription>
+                        </EmptyHeader>
+                      </Empty>
+                    ) : (
+                      <Empty className="h-full">
+                        <EmptyHeader>
+                          <SessionMark session={selected} />
+                          <EmptyTitle>This session is not running</EmptyTitle>
+                          <EmptyDescription>Resuming reopens it in the folder it was started in.</EmptyDescription>
+                        </EmptyHeader>
+                        <EmptyContent>
+                          <Button variant="outline" onClick={() => void launch(selected, true)}>
+                            <Play />
+                            Resume session
+                          </Button>
+                        </EmptyContent>
+                      </Empty>
+                    )}
+                  </div>
+                ) : (
+                  <Empty className="h-full">
+                    <EmptyHeader>
+                      <EmptyMedia variant="icon">
+                        <SquareTerminal />
+                      </EmptyMedia>
+                      <EmptyTitle>Start a session</EmptyTitle>
+                      <EmptyDescription>
+                        Pick a project folder, then choose the agent that should work in it.
+                      </EmptyDescription>
+                    </EmptyHeader>
+                    <EmptyContent>
+                      <Button onClick={() => setNewSessionOpen(true)}>
+                        <Plus />
+                        New session
+                      </Button>
+                    </EmptyContent>
+                  </Empty>
+                )}
+                {error ? (
+                  <div className="flex shrink-0 items-start gap-2 border-t bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                    <span className="min-w-0 flex-1">{error}</span>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      className="text-destructive hover:bg-destructive/10"
+                      onClick={() => setError("")}
+                      aria-label="Dismiss message"
+                    >
+                      <X />
                     </Button>
-                  </EmptyContent>
-                </Empty>
-              )}
-              {error ? (
-                <div className="flex shrink-0 items-start gap-2 border-t bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                  <span className="min-w-0 flex-1">{error}</span>
-                  <Button
-                    variant="ghost"
-                    size="icon-xs"
-                    className="text-destructive hover:bg-destructive/10"
-                    onClick={() => setError("")}
-                    aria-label="Dismiss message"
-                  >
-                    <X />
-                  </Button>
-                </div>
-              ) : null}
-            </section>
-          </ResizablePanel>
-          {selected ? (
-            <>
-              <ResizableHandle withHandle />
-              <ResizablePanel
-                panelRef={inspectorPanel}
-                defaultSize={SIDES.inspector.size}
-                minSize={RAIL}
-                maxSize={SIDES.inspector.max}
-                onResize={(size) => rail("inspector", size)}
-              >
-                <aside className="h-full border-l">
-                  <PanelBoundary key={selected.id}>
-                    <Inspector
-                      session={selected}
-                      collapsed={shut.inspector}
-                      onExpand={() =>
-                        glide(inspectorPanel.current, share(inspectorPanel.current, SIDES.inspector.size))
-                      }
-                      onCollapse={() => glide(inspectorPanel.current, RAIL)}
-                    />
-                  </PanelBoundary>
-                </aside>
-              </ResizablePanel>
-            </>
-          ) : null}
-        </ResizablePanelGroup>
-        <Dialog open={updateOpen} onOpenChange={changeUpdateOpen}>
-          <DialogContent
-            className="sm:max-w-lg"
-            showCloseButton={updateStatus !== "checking" && updateStatus !== "installing"}
-          >
-            <DialogHeader>
-              <div className="flex items-center gap-2">
-                <DialogTitle>Lite updates</DialogTitle>
-                <VersionBadge
-                  version={version}
-                  commit={commit}
-                  built={built}
-                  release={release}
-                  onCheck={() => void checkForUpdates()}
-                />
-              </div>
-              <DialogDescription aria-live="polite">
-                {updateStatus === "checking"
-                  ? commit
-                    ? "Comparing this build with the tree it was built from…"
-                    : "Checking GitHub for the latest release…"
-                  : null}
-                {updateStatus === "available"
-                  ? `Lite ${availableVersion} is ready. Updating stops running sessions; their tabs resume after restart.`
-                  : null}
-                {updateStatus === "rebuild"
-                  ? `This build is ${commit} and the tree is now ${availableVersion}. Rebuilding runs bun run local in a shell tab, and replaces this build when it finishes.`
-                  : null}
-                {updateStatus === "current" ? (
-                  <span className="flex items-center gap-1.5">
-                    <Check className="size-4 shrink-0 text-success" />
-                    {commit ? "This build matches the tree it was built from." : "You have the latest version of Lite."}
-                  </span>
+                  </div>
                 ) : null}
-                {updateStatus === "installing" ? "Downloading and installing the update…" : null}
-                {updateStatus === "error" ? `Update failed: ${updateError}` : null}
-              </DialogDescription>
-            </DialogHeader>
-            <DialogBody>
-              {/* A bar only once the download has a percent to put in it: an update whose size the
+              </section>
+            </ResizablePanel>
+            {selected ? (
+              <>
+                <ResizableHandle withHandle />
+                <ResizablePanel
+                  panelRef={inspectorPanel}
+                  defaultSize={SIDES.inspector.size}
+                  minSize={RAIL}
+                  maxSize={SIDES.inspector.max}
+                  onResize={(size) => rail("inspector", size)}
+                >
+                  <aside className="h-full border-l">
+                    <PanelBoundary key={selected.id}>
+                      <Inspector
+                        session={selected}
+                        remote={remote}
+                        collapsed={shut.inspector}
+                        onExpand={() =>
+                          glide(inspectorPanel.current, share(inspectorPanel.current, SIDES.inspector.size))
+                        }
+                        onCollapse={() => glide(inspectorPanel.current, RAIL)}
+                      />
+                    </PanelBoundary>
+                  </aside>
+                </ResizablePanel>
+              </>
+            ) : null}
+          </ResizablePanelGroup>
+          <Dialog open={updateOpen} onOpenChange={changeUpdateOpen}>
+            <DialogContent
+              className="sm:max-w-lg"
+              showCloseButton={updateStatus !== "checking" && updateStatus !== "installing"}
+            >
+              <DialogHeader>
+                <div className="flex items-center gap-2">
+                  <DialogTitle>Lite updates</DialogTitle>
+                  <VersionBadge
+                    version={version}
+                    commit={commit}
+                    built={built}
+                    release={release}
+                    onCheck={() => void checkForUpdates()}
+                  />
+                </div>
+                <DialogDescription aria-live="polite">
+                  {updateStatus === "checking"
+                    ? commit
+                      ? "Comparing this build with the tree it was built from…"
+                      : "Checking GitHub for the latest release…"
+                    : null}
+                  {updateStatus === "available"
+                    ? `Lite ${availableVersion} is ready. Updating stops running sessions; their tabs resume after restart.`
+                    : null}
+                  {updateStatus === "rebuild"
+                    ? `This build is ${commit} and the tree is now ${availableVersion}. Rebuilding runs bun run local in a shell tab, and replaces this build when it finishes.`
+                    : null}
+                  {updateStatus === "current" ? (
+                    <span className="flex items-center gap-1.5">
+                      <Check className="size-4 shrink-0 text-success" />
+                      {commit
+                        ? "This build matches the tree it was built from."
+                        : "You have the latest version of Lite."}
+                    </span>
+                  ) : null}
+                  {updateStatus === "installing" ? "Downloading and installing the update…" : null}
+                  {updateStatus === "error" ? `Update failed: ${updateError}` : null}
+                </DialogDescription>
+              </DialogHeader>
+              <DialogBody>
+                {/* A bar only once the download has a percent to put in it: an update whose size the
                   server never gave has none to give, and an empty bar would say less than the spinner
                   it replaced. */}
-              {updateStatus === "installing" && updateProgress !== null ? (
-                <Progress value={updateProgress}>
-                  <ProgressLabel>Downloading update</ProgressLabel>
-                  <ProgressValue />
-                </Progress>
-              ) : updateStatus === "checking" || updateStatus === "installing" ? (
-                <Spinner className="mx-auto size-5 text-muted-foreground" />
-              ) : (
-                // What this copy of Lite actually is, which is the first thing worth knowing when it and
-                // the tree disagree. A release has no tree to name and leaves those rows out.
-                <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-sm">
-                  <dt className="text-muted-foreground">Version</dt>
-                  <dd className="truncate font-mono">{version || "—"}</dd>
-                  {commit ? (
-                    <>
-                      <dt className="text-muted-foreground">Build</dt>
-                      <dd className="truncate font-mono">{commit}</dd>
-                    </>
-                  ) : null}
-                  {built ? (
-                    <>
-                      <dt className="text-muted-foreground">{commit ? "Built" : "Released"}</dt>
-                      <dd className="truncate">{built}</dd>
-                    </>
-                  ) : null}
-                  {repo ? (
-                    <>
-                      <dt className="text-muted-foreground">Source</dt>
-                      <dd className="truncate font-mono" title={repo}>
-                        {repo}
-                      </dd>
-                    </>
-                  ) : null}
-                </dl>
-              )}
-            </DialogBody>
+                {updateStatus === "installing" && updateProgress !== null ? (
+                  <Progress value={updateProgress}>
+                    <ProgressLabel>Downloading update</ProgressLabel>
+                    <ProgressValue />
+                  </Progress>
+                ) : updateStatus === "checking" || updateStatus === "installing" ? (
+                  <Spinner className="mx-auto size-5 text-muted-foreground" />
+                ) : (
+                  // What this copy of Lite actually is, which is the first thing worth knowing when it and
+                  // the tree disagree. A release has no tree to name and leaves those rows out.
+                  <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-sm">
+                    <dt className="text-muted-foreground">Version</dt>
+                    <dd className="truncate font-mono">{version || "—"}</dd>
+                    {commit ? (
+                      <>
+                        <dt className="text-muted-foreground">Build</dt>
+                        <dd className="truncate font-mono">{commit}</dd>
+                      </>
+                    ) : null}
+                    {built ? (
+                      <>
+                        <dt className="text-muted-foreground">{commit ? "Built" : "Released"}</dt>
+                        <dd className="truncate">{built}</dd>
+                      </>
+                    ) : null}
+                    {repo ? (
+                      <>
+                        <dt className="text-muted-foreground">Source</dt>
+                        <dd className="truncate font-mono" title={repo}>
+                          {repo}
+                        </dd>
+                      </>
+                    ) : null}
+                  </dl>
+                )}
+              </DialogBody>
 
-            {updateStatus === "available" ? (
+              {updateStatus === "available" ? (
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => changeUpdateOpen(false)}>
+                    Not now
+                  </Button>
+                  <Button onClick={() => void installUpdate()}>Install and restart</Button>
+                </DialogFooter>
+              ) : null}
+              {updateStatus === "rebuild" ? (
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => changeUpdateOpen(false)}>
+                    Not now
+                  </Button>
+                  <Button disabled={rebuilding} onClick={() => void rebuild()}>
+                    <Play />
+                    Rebuild
+                  </Button>
+                </DialogFooter>
+              ) : null}
+              {updateStatus === "current" ? (
+                <DialogFooter>
+                  <Button onClick={() => changeUpdateOpen(false)}>Done</Button>
+                </DialogFooter>
+              ) : null}
+              {updateStatus === "error" ? (
+                <DialogFooter>
+                  <Button onClick={() => void checkForUpdates()}>Try again</Button>
+                </DialogFooter>
+              ) : null}
+            </DialogContent>
+          </Dialog>
+          <Dialog open={Boolean(closing)} onOpenChange={(open) => !open && setClosing(undefined)}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>{closing === "all" ? "Close all sessions?" : `Close ${closing?.name}?`}</DialogTitle>
+                <DialogDescription>
+                  {closing === "all"
+                    ? "This stops every running session and removes all tabs. Providers keep their own conversation history."
+                    : closing?.running
+                      ? "This stops the running session and removes the tab. The provider keeps its own conversation history."
+                      : "This removes the tab. The provider keeps its own conversation history."}
+                </DialogDescription>
+              </DialogHeader>
               <DialogFooter>
-                <Button variant="outline" onClick={() => changeUpdateOpen(false)}>
-                  Not now
+                <Button variant="outline" onClick={() => setClosing(undefined)}>
+                  Keep
                 </Button>
-                <Button onClick={() => void installUpdate()}>Install and restart</Button>
-              </DialogFooter>
-            ) : null}
-            {updateStatus === "rebuild" ? (
-              <DialogFooter>
-                <Button variant="outline" onClick={() => changeUpdateOpen(false)}>
-                  Not now
+                <Button
+                  variant="destructive"
+                  onClick={() => {
+                    if (closing === "all") {
+                      void Promise.all(sessions.map(closeSession)).then(() => setSelectedId(""));
+                    } else if (closing) void closeSession(closing);
+                    setClosing(undefined);
+                  }}
+                >
+                  {closing === "all" ? "Close all sessions" : "Close session"}
                 </Button>
-                <Button disabled={rebuilding} onClick={() => void rebuild()}>
-                  <Play />
-                  Rebuild
-                </Button>
               </DialogFooter>
-            ) : null}
-            {updateStatus === "current" ? (
-              <DialogFooter>
-                <Button onClick={() => changeUpdateOpen(false)}>Done</Button>
-              </DialogFooter>
-            ) : null}
-            {updateStatus === "error" ? (
-              <DialogFooter>
-                <Button onClick={() => void checkForUpdates()}>Try again</Button>
-              </DialogFooter>
-            ) : null}
-          </DialogContent>
-        </Dialog>
-        <Dialog open={Boolean(closing)} onOpenChange={(open) => !open && setClosing(undefined)}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Close {closing?.name}?</DialogTitle>
-              <DialogDescription>
-                {closing?.running
-                  ? "This stops the running session and removes the tab. The provider keeps its own conversation history."
-                  : "This removes the tab. The provider keeps its own conversation history."}
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setClosing(undefined)}>
-                Keep
-              </Button>
-              <Button
-                variant="destructive"
-                onClick={() => {
-                  if (closing) void closeSession(closing);
-                  setClosing(undefined);
-                }}
-              >
-                Close session
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-        <NewSessionDialog open={newSessionOpen} onOpenChange={setNewSessionOpen} onCreate={createSession} />
-        <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} onSignIn={signIn} />
-      </div>
+            </DialogContent>
+          </Dialog>
+          <NewSessionDialog open={newSessionOpen} onOpenChange={setNewSessionOpen} onCreate={createSession} />
+          <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} onSignIn={signIn} />
+        </div>
+      </AppContextMenu>
     </TooltipProvider>
   );
 }

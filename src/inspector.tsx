@@ -5,6 +5,10 @@ import {
   ChartNoAxesColumn,
   ChevronLeft,
   ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  CircleCheck,
+  CircleDot,
   Container,
   Database,
   File,
@@ -24,7 +28,10 @@ import {
   FileVideo,
   Folder,
   GitBranch,
+  GitMerge,
   GitPullRequest,
+  GitPullRequestClosed,
+  GitPullRequestDraft,
   Hammer,
   type LucideIcon,
   RefreshCw,
@@ -33,6 +40,7 @@ import {
 } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { GitHubLogomark } from "@/brand-icons";
 import { Badge } from "@/components/ui/badge";
 import { ActionIconButton } from "@/components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader } from "@/components/ui/empty";
@@ -48,43 +56,172 @@ import type { DirectoryCursor, DirectoryListing, FileEntry, GitStatus, Session }
 const CodePreview = lazy(() => import("@/code-preview"));
 
 // A session's terminal is the only record of what it worked on, so what it named is read back out of
-// the output Lite already keeps. Only what Git and GitHub print verbatim counts: a whole pull request
-// link, and the two sentences Git answers a checkout with. A bare "#12" is as often a line number.
+// the output Lite already keeps. Only what GitHub prints verbatim counts: a whole pull request or issue
+// link. A bare "#12" is as often a line number.
 // Only CSI is stripped, so a link inside an OSC hyperlink survives being uncoloured.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: a color code has to be named to be removed.
 const COLOR = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
-const PULL_REQUEST = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
-const BRANCH = /(?:On branch|Switched to(?: a new)? branch) '?([\w./-]+)'?/g;
+const GITHUB_ITEM = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:pull|issues)\/\d+/g;
 
 function namedInSession(sessionId: string) {
   const text = readOutput(sessionId).replace(COLOR, "");
-  return {
-    branches: [...new Set([...text.matchAll(BRANCH)].map((match) => match[1]))],
-    pulls: [...new Set(text.match(PULL_REQUEST) ?? [])],
-  };
+  return [...new Set(text.match(GITHUB_ITEM) ?? [])];
 }
 
-// A pull request is known by its number and the repository it belongs to, not by the URL that reaches it.
-function pullLabel(url: string) {
-  const [owner, repository, , number] = url.split("/").slice(3);
-  return `${owner}/${repository} #${number}`;
+interface GitHubReference {
+  kind: "issue" | "pull request";
+  number: string;
+  repository: string;
+  repositoryUrl: string;
+}
+
+// GitHub work items are known by their repository, kind and number; that is also all the grouped UI needs.
+function githubReference(url: string): GitHubReference {
+  const [owner, repository, kind, number] = url.split("/").slice(3);
+  return {
+    kind: kind === "pull" ? "pull request" : "issue",
+    number,
+    repository: `${owner}/${repository}`,
+    repositoryUrl: `https://github.com/${owner}/${repository}`,
+  };
 }
 
 // Every optional field arrives from Serde as null, never as a missing key. A state of null is a link
 // GitHub could not be asked about rather than one it disowned; those are dropped before they arrive.
-interface PullRequest {
+interface GitHubItem {
   url: string;
   title: string | null;
-  state: keyof typeof PULL_STATE | null;
+  state: keyof typeof GITHUB_STATE | null;
+  occurredAt: string | null;
 }
 
 // The colors GitHub itself answers in, so a glance here reads the same as a glance there.
-const PULL_STATE = {
+const GITHUB_STATE = {
   open: "success",
   draft: "secondary",
   merged: "purple",
   closed: "error",
 } as const;
+
+const GITHUB_STATE_ICON = {
+  open: "text-success",
+  draft: "text-muted-foreground",
+  merged: "text-violet-700 dark:text-violet-400",
+  closed: "text-red-700 dark:text-red-400",
+} as const;
+
+interface RepositoryGroup {
+  branch: string | null;
+  changes: string[];
+  changesTruncated: boolean;
+  items: (GitHubItem & GitHubReference)[];
+  name: string;
+  path: string | null;
+  url: string | null;
+}
+
+function repositoryName(url: string) {
+  return url.replace(/^https:\/\/[^/]+\//, "");
+}
+
+function relativeAge(timestamp: string) {
+  const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(timestamp)) / 1000));
+  if (seconds < 60) return seconds < 10 ? "just now" : `${seconds} sec ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hr ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days} day${days === 1 ? "" : "s"} ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months} mo ago`;
+  const years = Math.floor(days / 365);
+  return `${years} yr ago`;
+}
+
+function GitHubItemIcon({ kind, state }: Pick<GitHubReference, "kind"> & Pick<GitHubItem, "state">) {
+  if (kind === "issue") return state === "closed" ? <CircleCheck /> : <CircleDot />;
+  if (state === "merged") return <GitMerge />;
+  if (state === "closed") return <GitPullRequestClosed />;
+  if (state === "draft") return <GitPullRequestDraft />;
+  return <GitPullRequest />;
+}
+
+// The current worktree is the first repository. Links then join it or create one group in the order
+// the session printed them, so neither a repeated URL nor a repeated repository repeats context.
+function repositoryGroups(remote: string, status: GitStatus | null, items: GitHubItem[]): RepositoryGroup[] {
+  const groups = new Map<string, RepositoryGroup>();
+  if (status) {
+    groups.set((remote || status.worktree).toLowerCase(), {
+      branch: status.branch,
+      changes: status.changes,
+      changesTruncated: status.changesTruncated,
+      items: [],
+      name: remote ? repositoryName(remote) : status.worktree.split(/[\\/]/).filter(Boolean).pop() || status.worktree,
+      path: status.worktree,
+      url: remote || null,
+    });
+  }
+  for (const item of items) {
+    const reference = githubReference(item.url);
+    const key = reference.repositoryUrl.toLowerCase();
+    const group = groups.get(key) ?? {
+      branch: null,
+      changes: [],
+      changesTruncated: false,
+      items: [],
+      name: reference.repository,
+      path: null,
+      url: reference.repositoryUrl,
+    };
+    group.items.push({ ...item, ...reference });
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) group.items.sort((left, right) => Number(right.number) - Number(left.number));
+  return [...groups.values()];
+}
+
+function GitHubItemList({ label, items }: { label: string; items: RepositoryGroup["items"] }) {
+  if (!items.length) return null;
+  return (
+    <div className="border-t">
+      <p className="px-3 pt-2 pb-1 text-xs font-medium text-muted-foreground">{label}</p>
+      <ItemGroup className="has-data-[size=xs]:gap-0">
+        {items.map(({ url, title, state, occurredAt, kind, number }) => (
+          <Item
+            key={url}
+            size="xs"
+            className="flex-nowrap items-start rounded-none px-3 text-left hover:bg-muted"
+            render={
+              <button
+                type="button"
+                title={url}
+                data-context-url={url}
+                onClick={() => void invoke("open_url", { url })}
+              />
+            }
+          >
+            <ItemMedia variant="icon" className={state ? GITHUB_STATE_ICON[state] : "text-muted-foreground"}>
+              <GitHubItemIcon kind={kind} state={state} />
+            </ItemMedia>
+            <ItemContent>
+              <ItemTitle className="w-full">{title ?? `#${number}`}</ItemTitle>
+              {title ? (
+                <div className="flex min-w-0 items-center gap-2">
+                  <ItemDescription className="min-w-0 flex-1 truncate font-mono">
+                    #{number}
+                    {occurredAt ? ` · ${relativeAge(occurredAt)}` : ""}
+                  </ItemDescription>
+                  {state ? <Badge variant={GITHUB_STATE[state]}>{state}</Badge> : null}
+                </div>
+              ) : null}
+            </ItemContent>
+          </Item>
+        ))}
+      </ItemGroup>
+    </div>
+  );
+}
 
 // One list so a tab, its icon and the name every surface calls it by cannot drift apart, including the
 // rail the panel collapses to.
@@ -207,6 +344,7 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
   const [expanded, setExpanded] = useState(() => new Set<string>([root]));
   const loading = useRef(new Set<string>());
   const [loadingPaths, setLoadingPaths] = useState(() => new Set<string>());
+  const [expandingAll, setExpandingAll] = useState(false);
   const [error, setError] = useState("");
 
   const load = useCallback(
@@ -248,6 +386,36 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
     setExpanded(next);
   }
 
+  async function expandAll() {
+    setExpandingAll(true);
+    const nextChildren = { ...children };
+    const nextExpanded = new Set<string>();
+    const pending = [root];
+    try {
+      while (pending.length) {
+        const path = pending.shift();
+        if (!path || nextExpanded.has(path)) continue;
+        nextExpanded.add(path);
+        const cached = nextChildren[path];
+        const listing =
+          cached && !cached.after
+            ? cached
+            : { ...(await invoke<DirectoryListing>("list_directory", { rootId, path, after: null })), after: null };
+        nextChildren[path] = listing;
+        pending.push(
+          ...listing.entries.filter((entry) => entry.isDirectory && !entry.isSymlink).map((entry) => entry.path),
+        );
+      }
+      setChildren(nextChildren);
+      setExpanded(nextExpanded);
+      setError("");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setExpandingAll(false);
+    }
+  }
+
   function rows(path: string, depth = 0): React.ReactNode {
     const listing = children[path];
     if (!listing) {
@@ -262,6 +430,10 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
               type="button"
               className="flex h-7 w-full items-center gap-1.5 rounded-md pr-2 text-left text-xs hover:bg-muted"
               style={{ paddingLeft: `${8 + depth * 14}px` }}
+              data-context-value={entry.path}
+              data-context-label="Copy path"
+              data-context-directory={entry.isDirectory ? "" : undefined}
+              data-context-expanded={entry.isDirectory ? expanded.has(entry.path) : undefined}
               onClick={() => (entry.isDirectory ? void toggle(entry.path) : onOpen(entry))}
             >
               {entry.isDirectory ? (
@@ -313,17 +485,43 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
   const name = parts[parts.length - 1] ?? root;
   return (
     <div className="py-2">
-      <button
-        type="button"
-        className="flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-left text-xs font-medium hover:bg-muted"
-        onClick={() => void toggle(root)}
-      >
-        <ChevronRight
-          className={`size-3.5 text-muted-foreground transition-transform ${expanded.has(root) ? "rotate-90" : ""}`}
-        />
-        <Folder className="size-3.5 fill-current text-muted-foreground" />
-        <span className="truncate">{name}</span>
-      </button>
+      <div className="flex items-center pr-1">
+        <button
+          type="button"
+          className="flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded-md px-2 text-left text-xs font-medium hover:bg-muted"
+          data-context-value={root}
+          data-context-label="Copy path"
+          data-context-directory
+          data-context-expanded={expanded.has(root)}
+          onClick={() => void toggle(root)}
+        >
+          <ChevronRight
+            className={`size-3.5 text-muted-foreground transition-transform ${expanded.has(root) ? "rotate-90" : ""}`}
+          />
+          <Folder className="size-3.5 fill-current text-muted-foreground" />
+          <span className="truncate">{name}</span>
+        </button>
+        <ActionIconButton
+          size="icon-xs"
+          tooltip="Expand all"
+          aria-label="Expand all folders"
+          data-context-expand-files
+          disabled={expandingAll}
+          onClick={() => void expandAll()}
+        >
+          {expandingAll ? <Spinner /> : <ChevronsUpDown />}
+        </ActionIconButton>
+        <ActionIconButton
+          size="icon-xs"
+          tooltip="Collapse all"
+          aria-label="Collapse all folders"
+          data-context-collapse-files
+          disabled={expandingAll}
+          onClick={() => setExpanded(new Set())}
+        >
+          <ChevronsDownUp />
+        </ActionIconButton>
+      </div>
       {expanded.has(root) ? rows(root, 1) : null}
     </div>
   );
@@ -373,7 +571,7 @@ function FilesPanel({ root, rootId }: { root: string; rootId: string }) {
     );
   }
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div data-context-files className="flex h-full min-h-0 flex-col">
       <ScrollArea className="min-h-0 flex-1">
         <FileTree root={root} rootId={rootId} onOpen={(entry) => void openFile(entry)} />
       </ScrollArea>
@@ -381,26 +579,91 @@ function FilesPanel({ root, rootId }: { root: string; rootId: string }) {
   );
 }
 
-function GitPanel({ rootId, sessionId }: { rootId: string; sessionId: string }) {
+function RepositoryCard({ repository }: { repository: RepositoryGroup }) {
+  const pullRequests = repository.items.filter((item) => item.kind === "pull request");
+  const issues = repository.items.filter((item) => item.kind === "issue");
+  const header = (
+    <>
+      <span className="flex min-w-0 w-full items-center gap-2.5">
+        <GitHubLogomark className="size-5 shrink-0" />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-sm font-medium">{repository.name}</span>
+          {repository.path ? (
+            <span className="block truncate font-mono text-xs text-muted-foreground" title={repository.path}>
+              {repository.path}
+            </span>
+          ) : null}
+        </span>
+      </span>
+      {repository.branch ? (
+        <span className="flex min-w-0 w-full items-center gap-1.5 pl-8">
+          <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 truncate font-mono text-xs">{repository.branch}</span>
+          {repository.changes.length ? (
+            <Badge variant="secondary">
+              {repository.changes.length}
+              {repository.changesTruncated ? "+" : ""} changed
+            </Badge>
+          ) : null}
+        </span>
+      ) : null}
+    </>
+  );
+
+  return (
+    <section className="overflow-hidden rounded-lg border">
+      {repository.url ? (
+        <button
+          type="button"
+          className="flex w-full flex-wrap items-center gap-x-3 gap-y-1.5 px-3 py-2.5 text-left hover:bg-muted"
+          title={`Open ${repository.url}`}
+          data-context-url={repository.url}
+          onClick={() => void invoke("open_url", { url: repository.url })}
+        >
+          {header}
+        </button>
+      ) : (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3 py-2.5">{header}</div>
+      )}
+      {repository.changes.length ? (
+        <div className="border-t px-2.5 py-2">
+          <p className="mb-1 px-0.5 text-xs font-medium">Changes</p>
+          {repository.changes.map((change) => (
+            <div key={change} className="flex items-center gap-2 rounded-md px-1.5 py-1 hover:bg-muted">
+              <span className="w-5 shrink-0 font-mono text-xs text-muted-foreground">{change.slice(0, 2).trim()}</span>
+              <span className="min-w-0 truncate font-mono text-xs" title={change.slice(3)}>
+                {change.slice(3)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <GitHubItemList label="Pull requests" items={pullRequests} />
+      <GitHubItemList label="Issues" items={issues} />
+    </section>
+  );
+}
+
+function GitPanel({ rootId, sessionId, remote }: { rootId: string; sessionId: string; remote: string }) {
   // Read once when the panel is built, like every other thing this panel shows: the refresh button
   // rebuilds it, and nothing here watches the session between those two moments.
   const named = useMemo(() => namedInSession(sessionId), [sessionId]);
   const [status, setStatus] = useState<GitStatus | null>();
-  const [pulls, setPulls] = useState<PullRequest[]>();
+  const [items, setItems] = useState<GitHubItem[]>();
   const [error, setError] = useState("");
 
   // The panel is only built when the tab is opened and again whenever it is refreshed, so asking
   // GitHub here asks it exactly on those two occasions and never between them.
   useEffect(() => {
-    if (!named.pulls.length) return setPulls([]);
+    if (!named.length) return setItems([]);
     let disposed = false;
-    void invoke<PullRequest[]>("pull_requests", { urls: named.pulls })
+    void invoke<GitHubItem[]>("github_items", { urls: named })
       .then((checked) => {
-        if (!disposed) setPulls(checked);
+        if (!disposed) setItems(checked);
       })
       // A link that could not be checked is still a link, so it is shown the way it was printed.
       .catch(() => {
-        if (!disposed) setPulls(named.pulls.map((url) => ({ url, title: null, state: null })));
+        if (!disposed) setItems(named.map((url) => ({ url, title: null, state: null, occurredAt: null })));
       });
     return () => {
       disposed = true;
@@ -420,96 +683,27 @@ function GitPanel({ rootId, sessionId }: { rootId: string; sessionId: string }) 
     void refresh();
   }, [refresh]);
 
+  const repositories = repositoryGroups(remote, status ?? null, items ?? []);
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <ScrollArea className="min-h-0 flex-1">
-        <div className="p-3">
-          {error ? (
-            <p className="text-sm text-destructive">{error}</p>
-          ) : status === undefined ? (
-            <Loading label="Reading Git status…" />
-          ) : status === null ? (
+        <div className="flex flex-col gap-3 p-3">
+          {error ? <p className="text-sm text-destructive">{error}</p> : null}
+          {!error && status === undefined ? <Loading label="Reading Git status…" /> : null}
+          {repositories.map((repository) => (
+            <RepositoryCard key={(repository.url ?? repository.path)?.toLowerCase()} repository={repository} />
+          ))}
+          {items === undefined && named.length ? <Loading label="Checking GitHub links…" /> : null}
+          {status === null && items && !repositories.length ? (
             <Empty>
               <EmptyHeader>
-                <EmptyDescription>This folder is not a Git repository.</EmptyDescription>
+                <EmptyDescription>
+                  This folder is not a Git repository, and this session has not named a GitHub pull request or issue.
+                </EmptyDescription>
               </EmptyHeader>
             </Empty>
-          ) : (
-            <div className="flex flex-col gap-4">
-              <Item variant="outline">
-                <ItemMedia variant="icon">
-                  <GitBranch />
-                </ItemMedia>
-                <ItemContent>
-                  <ItemTitle className="font-mono">{status.branch}</ItemTitle>
-                  <ItemDescription className="font-mono" title={status.worktree}>
-                    {status.worktree}
-                  </ItemDescription>
-                </ItemContent>
-                <Badge variant={status.changes.length ? "secondary" : "outline"}>
-                  {status.changes.length
-                    ? `${status.changes.length}${status.changesTruncated ? "+" : ""} changed`
-                    : "Clean"}
-                </Badge>
-              </Item>
-              {status.changes.length ? (
-                <section className="flex flex-col gap-2">
-                  <p className="text-sm font-medium">Changes</p>
-                  <ItemGroup>
-                    {status.changes.map((change) => (
-                      <Item key={change} size="xs" className="hover:bg-muted">
-                        <span className="w-5 shrink-0 font-mono text-xs text-muted-foreground">
-                          {change.slice(0, 2).trim()}
-                        </span>
-                        <span className="truncate font-mono text-sm" title={change.slice(3)}>
-                          {change.slice(3)}
-                        </span>
-                      </Item>
-                    ))}
-                  </ItemGroup>
-                </section>
-              ) : null}
-              <section className="flex flex-col gap-2">
-                <p className="text-sm font-medium">Named in this session</p>
-                <ItemGroup>
-                  {named.branches.map((branch) => (
-                    <Item key={branch} size="xs">
-                      <ItemMedia variant="icon" className="text-muted-foreground">
-                        <GitBranch />
-                      </ItemMedia>
-                      <span className="truncate font-mono text-sm">{branch}</span>
-                    </Item>
-                  ))}
-                  {pulls?.map(({ url, title, state }) => (
-                    <Item
-                      key={url}
-                      size="xs"
-                      className="hover:bg-muted"
-                      render={<button type="button" title={url} onClick={() => void invoke("open_url", { url })} />}
-                    >
-                      <ItemMedia variant="icon" className="text-muted-foreground">
-                        <GitPullRequest />
-                      </ItemMedia>
-                      <ItemContent>
-                        <ItemTitle className="underline-offset-2 group-hover/item:underline">
-                          {title ?? pullLabel(url)}
-                        </ItemTitle>
-                        {title ? <ItemDescription className="font-mono">{pullLabel(url)}</ItemDescription> : null}
-                      </ItemContent>
-                      {state ? <Badge variant={PULL_STATE[state]}>{state}</Badge> : null}
-                    </Item>
-                  ))}
-                </ItemGroup>
-                {pulls === undefined && named.pulls.length ? <Loading label="Checking pull requests…" /> : null}
-                {/* Also what is left when every link a session printed turned out to name nothing. */}
-                {pulls && !named.branches.length && !pulls.length ? (
-                  <ItemDescription>
-                    Branches this session checked out and pull request links it printed appear here.
-                  </ItemDescription>
-                ) : null}
-              </section>
-            </div>
-          )}
+          ) : null}
         </div>
       </ScrollArea>
     </div>
@@ -615,30 +809,47 @@ function UsagePanel({ session }: { session: Session }) {
 
 export function Inspector({
   session,
+  remote,
   collapsed,
   onExpand,
   onCollapse,
 }: {
   session: Session;
+  remote: string;
   collapsed: boolean;
   onExpand: () => void;
   onCollapse: () => void;
 }) {
   const [tab, setTab] = useState<string>(TABS[0].value);
+  const [visited, setVisited] = useState(() => new Set<string>([TABS[0].value]));
   // A tab already names the panel it shows, so the panel does not name itself again. One button beside
   // the tabs rereads whichever is open, by rebuilding it, and only that one ever reads the disk.
   const [reload, setReload] = useState({ files: 0, git: 0, usage: 0 });
+
+  function selectTab(value: string) {
+    setTab(value);
+    setVisited((current) => {
+      if (current.has(value)) return current;
+      const next = new Set(current);
+      next.add(value);
+      return next;
+    });
+  }
 
   // Collapsed, the panel is the strip of tabs it collapsed from: the one you pick is the one it reopens
   // on. What it was showing is hidden rather than thrown away, so the file you had open is still open
   // when it comes back, and a hidden panel reads nothing because nothing here reads without being asked.
   const rail = (
-    <div className="flex animate-in flex-col items-center gap-0.5 py-1.5 fade-in duration-200">
+    <div
+      data-context-surface
+      className="flex h-full animate-in flex-col items-center gap-0.5 py-1.5 fade-in duration-200"
+    >
       <ActionIconButton
         size="icon-sm"
         tooltip="Expand panel"
         tooltipSide="left"
         aria-label="Expand panel"
+        data-context-expand-panel
         onClick={onExpand}
       >
         <ChevronLeft />
@@ -652,7 +863,7 @@ export function Inspector({
           tooltipSide="left"
           aria-label={label}
           onClick={() => {
-            setTab(value);
+            selectTab(value);
             onExpand();
           }}
         >
@@ -665,10 +876,16 @@ export function Inspector({
   return (
     <>
       {collapsed ? rail : null}
-      <div className={collapsed ? "hidden" : "h-full"}>
-        <Tabs value={tab} onValueChange={setTab} className="h-full min-h-0 gap-0">
+      <div data-context-surface className={collapsed ? "hidden" : "h-full"}>
+        <Tabs value={tab} onValueChange={selectTab} className="h-full min-h-0 gap-0">
           <div className="flex h-11 shrink-0 items-center gap-0.5 border-b pr-3 pl-1.5">
-            <ActionIconButton size="icon-sm" tooltip="Collapse panel" aria-label="Collapse panel" onClick={onCollapse}>
+            <ActionIconButton
+              size="icon-sm"
+              tooltip="Collapse panel"
+              aria-label="Collapse panel"
+              data-context-collapse-panel
+              onClick={onCollapse}
+            >
               <ChevronRight />
             </ActionIconButton>
             <TabsList variant="line">
@@ -687,6 +904,7 @@ export function Inspector({
                   size="icon-sm"
                   tooltip="Refresh"
                   aria-label="Refresh"
+                  data-context-refresh
                   onClick={() => setReload((counts) => ({ ...counts, [tab]: counts[tab as keyof typeof counts] + 1 }))}
                 >
                   <RefreshCw />
@@ -694,15 +912,21 @@ export function Inspector({
               )}
             </span>
           </div>
-          <TabsContent value="files" className="min-h-0 overflow-hidden">
-            <FilesPanel key={reload.files} root={session.cwd} rootId={session.rootId} />
-          </TabsContent>
-          <TabsContent value="git" className="min-h-0 overflow-hidden">
-            <GitPanel key={reload.git} rootId={session.rootId} sessionId={session.id} />
-          </TabsContent>
-          <TabsContent value="usage" className="min-h-0 overflow-hidden">
-            <UsagePanel key={reload.usage} session={session} />
-          </TabsContent>
+          {visited.has("files") ? (
+            <TabsContent value="files" keepMounted className="min-h-0 overflow-hidden">
+              <FilesPanel key={reload.files} root={session.cwd} rootId={session.rootId} />
+            </TabsContent>
+          ) : null}
+          {visited.has("git") ? (
+            <TabsContent value="git" keepMounted className="min-h-0 overflow-hidden">
+              <GitPanel key={reload.git} rootId={session.rootId} sessionId={session.id} remote={remote} />
+            </TabsContent>
+          ) : null}
+          {visited.has("usage") ? (
+            <TabsContent value="usage" keepMounted className="min-h-0 overflow-hidden">
+              <UsagePanel key={reload.usage} session={session} />
+            </TabsContent>
+          ) : null}
         </Tabs>
       </div>
     </>

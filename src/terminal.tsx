@@ -101,6 +101,8 @@ export function TerminalView({
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    const keepNativeMenu = (event: MouseEvent) => event.stopPropagation();
+    container.addEventListener("contextmenu", keepNativeMenu);
 
     const terminal = new Terminal({
       cursorBlink: true,
@@ -176,6 +178,7 @@ export function TerminalView({
 
     return () => {
       window.clearTimeout(settle);
+      container.removeEventListener("contextmenu", keepNativeMenu);
       observer.disconnect();
       input.dispose();
       unsubscribe();
@@ -193,10 +196,9 @@ export function TerminalView({
   // and it only subtracts padding declared on the terminal's own element. Padding here would be
   // counted as usable space, so the terminal laid out a row and three columns more than fit and hung
   // them past the edge, which also left the last row below the viewport where the scrollbar could
-  // neither show nor reach it. The bottom gutter is deeper than the rest for the same reason it is
-  // there at all: the row the terminal cannot quite fit should end above the edge, not against it.
+  // neither show nor reach it.
   return (
-    <div className="h-full w-full bg-background p-3 pb-6">
+    <div className="h-full w-full bg-background p-3">
       <div ref={containerRef} className="h-full w-full" />
     </div>
   );
