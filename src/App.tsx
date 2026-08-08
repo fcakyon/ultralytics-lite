@@ -1109,6 +1109,7 @@ function App() {
         sessionId: session.id,
         runId,
         rootId: session.rootId,
+        cwd: session.cwd,
         providerSessionId: session.providerSessionId,
         agent: session.agent,
         provider: session.provider,
@@ -1117,11 +1118,6 @@ function App() {
         resume,
         cols: 100,
         rows: 30,
-      });
-      setStartingIds((current) => {
-        const next = new Set(current);
-        next.delete(session.id);
-        return next;
       });
       if (runs.current.get(session.id) !== runId) return;
       setSessions((current) =>
@@ -1137,13 +1133,14 @@ function App() {
       );
     } catch (reason) {
       if (runs.current.get(session.id) === runId) runs.current.delete(session.id);
+      setSessions((current) => current.map((item) => (item.id === session.id ? { ...item, running: false } : item)));
+      setError(String(reason));
+    } finally {
       setStartingIds((current) => {
         const next = new Set(current);
         next.delete(session.id);
         return next;
       });
-      setSessions((current) => current.map((item) => (item.id === session.id ? { ...item, running: false } : item)));
-      setError(String(reason));
     }
   }, []);
 
@@ -1238,7 +1235,7 @@ function App() {
     if (cleanupError) setError(`Session closed, but local cleanup failed: ${cleanupError}`);
   }
 
-  // Closing from a session row is reversible: the row leaves immediately and its PTY stops, while the
+  // Closing a session is reversible: the row leaves immediately and its PTY stops, while the
   // provider session metadata and directory grant remain until the toast closes without being undone.
   function closeSession(session: Session) {
     const index = sessions.findIndex((item) => item.id === session.id);
@@ -1288,7 +1285,7 @@ function App() {
       type: "success",
       timeout: 8000,
       onClose: async () => {
-        if (!undone && (await stopped)) await cleanupSession(session);
+        if ((await stopped) && !undone) await cleanupSession(session);
       },
       actionProps: {
         children: "Undo",
@@ -1396,9 +1393,9 @@ function App() {
             <Tooltip>
               <TooltipTrigger
                 render={
-                  <button
-                    type="button"
-                    className="shrink-0"
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
                     aria-label="Lite on GitHub"
                     data-context-url="https://github.com/ultralytics/lite"
                     onClick={() => void invoke("open_url", { url: "https://github.com/ultralytics/lite" })}
@@ -1426,9 +1423,10 @@ function App() {
                   <Tooltip>
                     <TooltipTrigger
                       render={
-                        <button
-                          type="button"
-                          className="flex max-w-56 shrink-0 items-center gap-1.5 text-muted-foreground hover:text-foreground"
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="max-w-56 gap-1.5 text-muted-foreground"
                           data-context-url={remote}
                           onClick={() => void invoke("open_url", { url: remote })}
                         />
@@ -1530,11 +1528,15 @@ function App() {
                         <Tooltip key={session.id}>
                           <TooltipTrigger
                             render={
-                              <button
-                                type="button"
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
                                 aria-pressed={session.id === selectedId}
+                                aria-label={session.name}
                                 data-context-session={session.id}
-                                className={`rounded-lg p-1 ${session.id === selectedId ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/60"}`}
+                                className={
+                                  session.id === selectedId ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/60"
+                                }
                                 onClick={() => openRef.current(session)}
                               />
                             }
@@ -1624,7 +1626,20 @@ function App() {
             <ResizablePanel defaultSize="55%" minSize="38%">
               <section className="flex h-full min-w-0 flex-col">
                 {selected ? (
-                  <div className="min-h-0 flex-1">
+                  <div className="relative min-h-0 flex-1">
+                    {selected.running ? (
+                      <ActionIconButton
+                        variant="outline"
+                        size="icon-sm"
+                        className="absolute top-2 right-2 z-10 bg-background/90 hover:text-destructive"
+                        tooltip="Close session"
+                        tooltipSide="left"
+                        aria-label={`Close ${selected.name}`}
+                        onClick={() => closeSession(selected)}
+                      >
+                        <Trash2 />
+                      </ActionIconButton>
+                    ) : null}
                     {selected.running ? (
                       <Suspense fallback={<div className="h-full bg-background" />}>
                         <TerminalView

@@ -11,7 +11,7 @@ use std::{
     process::{Command, Stdio},
     sync::Mutex,
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -447,17 +447,25 @@ fn shell_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
 }
 
-// Claude files a session under a key derived from its working directory. Searching for the transcript
-// by name avoids depending on how that key is spelled, and a session it never wrote cannot be resumed.
-fn claude_session_exists(app: &AppHandle, session_id: &str) -> bool {
-    let Ok(home) = std::env::var_os("CLAUDE_CONFIG_DIR")
+fn provider_home(app: &AppHandle, variable: &str, fallback: &str) -> Result<PathBuf, String> {
+    std::env::var_os(variable)
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .map_or_else(
-            || app.path().home_dir().map(|home| home.join(".claude")),
+            || {
+                app.path()
+                    .home_dir()
+                    .map(|home| home.join(fallback))
+                    .map_err(|error| error.to_string())
+            },
             Ok,
         )
-    else {
+}
+
+// Claude files a session under a key derived from its working directory. Searching for the transcript
+// by name avoids depending on how that key is spelled, and a session it never wrote cannot be resumed.
+fn claude_session_exists(app: &AppHandle, session_id: &str) -> bool {
+    let Ok(home) = provider_home(app, "CLAUDE_CONFIG_DIR", ".claude") else {
         return false;
     };
     let transcript = format!("{session_id}.jsonl");
@@ -505,7 +513,10 @@ pub fn capture_claude_status(path: &str) -> Result<(), String> {
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let mut windows = Vec::new();
-    for (key, label) in [("five_hour", "5 hour"), ("seven_day", "7 day")] {
+    for (key, label) in [
+        ("five_hour", "Current session"),
+        ("seven_day", "Current week"),
+    ] {
         if let Some(window) = input.get("rate_limits").and_then(|limits| limits.get(key)) {
             if let Some(used_percent) = window
                 .get("used_percentage")
@@ -1401,18 +1412,7 @@ fn executable_exists(name: &str) -> bool {
 }
 
 fn codex_home(app: &AppHandle) -> Result<PathBuf, String> {
-    std::env::var_os("CODEX_HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .map_or_else(
-            || {
-                app.path()
-                    .home_dir()
-                    .map(|home| home.join(".codex"))
-                    .map_err(|error| error.to_string())
-            },
-            Ok,
-        )
+    provider_home(app, "CODEX_HOME", ".codex")
 }
 
 // Looks only for the section header. The DeepSeek credential lives in that file and is never read.
@@ -1451,18 +1451,7 @@ fn deepseek_profile_exists(app: &AppHandle) -> bool {
 }
 
 fn kimi_home(app: &AppHandle) -> Result<PathBuf, String> {
-    std::env::var_os("KIMI_CODE_HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .map_or_else(
-            || {
-                app.path()
-                    .home_dir()
-                    .map(|home| home.join(".kimi-code"))
-                    .map_err(|error| error.to_string())
-            },
-            Ok,
-        )
+    provider_home(app, "KIMI_CODE_HOME", ".kimi-code")
 }
 
 // Kimi groups sessions under an opaque per-directory key that its workspace index maps back to a path.
@@ -1761,6 +1750,7 @@ async fn spawn_session(
     session_id: String,
     run_id: String,
     root_id: String,
+    cwd: String,
     mut provider_session_id: Option<String>,
     agent: String,
     provider: Option<String>,
@@ -1770,6 +1760,21 @@ async fn spawn_session(
     cols: u16,
     rows: u16,
 ) -> Result<Option<String>, String> {
+    if !roots
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .contains_key(&root_id)
+    {
+        uuid::Uuid::parse_str(&root_id).map_err(|_| "Invalid folder permission")?;
+        let path = fs::canonicalize(cwd).map_err(|_| "The selected folder no longer exists")?;
+        if is_sensitive_root(&path) {
+            return Err("Credential and configuration folders cannot be opened".into());
+        }
+        update_roots(&app, &roots, |roots| {
+            roots.entry(root_id.clone()).or_insert(path);
+        })?;
+    }
     let cwd = root_path(&roots, &root_id)?;
     // A sign-in runs the provider's own login command and owns no session of its own.
     let signing_in = mode.as_deref() == Some("login");
@@ -2277,18 +2282,79 @@ async fn read_usage(
     }
     match agent.as_str() {
         "claude" => {
-            let path = app
+            let directory = app
                 .path()
                 .app_data_dir()
-                .map_err(|error| error.to_string())?
-                .join(format!("usage-{session_id}.json"));
-            match fs::read(path) {
-                Ok(bytes) => serde_json::from_slice(&bytes)
-                    .map(Some)
-                    .map_err(|error| error.to_string()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error.to_string()),
+                .map_err(|error| error.to_string())?;
+            let path = directory.join(format!("usage-{session_id}.json"));
+            let mut usage = match fs::read(path) {
+                Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string())?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    UsageSnapshot::default()
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            // Claude's limits are account-wide, while its context and cost belong to this session.
+            // Use Claude's newest report for each account-wide limit rather than hiding one when the
+            // selected session has not sent a message yet or another report omitted that window.
+            if let Ok(entries) = fs::read_dir(directory) {
+                let mut latest = [None, None];
+                for (modified, window) in entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.file_name().to_str().is_some_and(|name| {
+                            name.starts_with("usage-") && name.ends_with(".json")
+                        })
+                    })
+                    .filter_map(|entry| {
+                        let modified = entry.metadata().ok()?.modified().ok()?;
+                        let snapshot: UsageSnapshot =
+                            serde_json::from_slice(&fs::read(entry.path()).ok()?).ok()?;
+                        Some((modified, snapshot.windows))
+                    })
+                    .flat_map(|(modified, windows)| {
+                        windows.into_iter().map(move |window| (modified, window))
+                    })
+                {
+                    let index = match window.label.as_str() {
+                        "Current session" | "5 hour" => 0,
+                        "Current week" | "7 day" => 1,
+                        _ => continue,
+                    };
+                    if latest[index]
+                        .as_ref()
+                        .is_none_or(|(current, _)| modified > *current)
+                    {
+                        latest[index] = Some((modified, window));
+                    }
+                }
+                let windows: Vec<_> = latest
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, window)| window)
+                    .collect();
+                if !windows.is_empty() {
+                    usage.windows = windows;
+                }
             }
+            for window in &mut usage.windows {
+                window.label = match window.label.as_str() {
+                    "5 hour" => "Current session".into(),
+                    "7 day" => "Current week".into(),
+                    _ => continue,
+                };
+            }
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            usage
+                .windows
+                .retain(|window| window.resets_at.is_none_or(|reset| reset > now));
+            Ok((usage.context_used_percent.is_some()
+                || usage.context_tokens.is_some_and(|tokens| tokens > 0)
+                || usage.cost_usd.is_some_and(|cost| cost > 0.0)
+                || !usage.windows.is_empty())
+            .then_some(usage))
         }
         "codex" => codex_usage(&codex_server).map(Some),
         "kimi" | "shell" => Ok(None),
