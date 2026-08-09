@@ -9,11 +9,14 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, SystemTime},
 };
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_updater::UpdaterExt;
@@ -22,6 +25,7 @@ use tungstenite::Message;
 const MAX_FILE_BYTES: u64 = 500_000;
 const DIRECTORY_PAGE_SIZE: usize = 250;
 const MAX_GIT_CHANGES: usize = 500;
+const MAX_GIT_DIFF_BYTES: u64 = 1_000_000;
 const CODEX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // Requests stay bounded so an app server that never answers surfaces an error instead of a stuck tab.
 const CODEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -34,9 +38,12 @@ struct PtySession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     run_id: String,
+    alive: Arc<AtomicBool>,
+    agent_watch: Arc<AtomicU64>,
 }
 
 fn stop_pty(session: &mut PtySession) -> Result<(), String> {
+    session.alive.store(false, Ordering::Relaxed);
     let running = session
         .child
         .try_wait()
@@ -80,6 +87,14 @@ struct PtyOutput {
 struct PtyExit {
     session_id: String,
     run_id: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellAgent {
+    session_id: String,
+    run_id: String,
+    agent: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -127,7 +142,14 @@ struct GitStatus {
     branch: String,
     worktree: String,
     changes: Vec<String>,
+    line_diffs: BTreeMap<String, LineDiff>,
     changes_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct LineDiff {
+    additions: u64,
+    deletions: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2016,6 +2038,14 @@ async fn open_url(url: String) -> Result<(), String> {
     open_external(&url)
 }
 
+// A session root has already been chosen by the user and registered with Lite. Resolve that grant
+// again here so the interface cannot ask the operating system to open an arbitrary path.
+#[tauri::command]
+fn open_directory(root_id: String, roots: State<'_, Roots>) -> Result<(), String> {
+    let path = root_path(&roots, &root_id)?;
+    open_external(&path_text(&path))
+}
+
 fn open_external(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut command = Command::new("open");
@@ -2228,6 +2258,8 @@ async fn spawn_session(
             master: pair.master,
             writer,
             run_id: run_id.clone(),
+            alive: Arc::new(AtomicBool::new(true)),
+            agent_watch: Arc::new(AtomicU64::new(0)),
         },
     );
     drop(running);
@@ -2324,6 +2356,132 @@ async fn spawn_session(
     }
 
     Ok(provider_session_id)
+}
+
+fn is_agent_process(process: &sysinfo::Process, agent: &str) -> bool {
+    let name = process.name().to_string_lossy().to_ascii_lowercase();
+    if name.strip_suffix(".exe").unwrap_or(&name) == agent {
+        return true;
+    }
+    process.cmd().iter().any(|argument| {
+        let argument = argument.to_string_lossy().to_ascii_lowercase();
+        let executable = Path::new(&argument)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        executable.strip_suffix(".exe").unwrap_or(executable) == agent
+            || (agent == "codex" && executable == "codex.js")
+            || (agent == "kimi" && argument.contains("kimi-code"))
+    })
+}
+
+fn agent_descendants(system: &System, root: sysinfo::Pid, agent: &str) -> Vec<sysinfo::Pid> {
+    system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            if !is_agent_process(process, agent) {
+                return None;
+            }
+            let mut parent = process.parent();
+            while let Some(ancestor) = parent {
+                if ancestor == root {
+                    return Some(*pid);
+                }
+                parent = system
+                    .process(ancestor)
+                    .and_then(|process| process.parent());
+            }
+            None
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn watch_shell_agent(
+    app: AppHandle,
+    sessions: State<Sessions>,
+    session_id: String,
+    agent: String,
+) -> Result<(), String> {
+    if !matches!(agent.as_str(), "claude" | "codex" | "kimi") {
+        return Err("Unknown agent".into());
+    }
+    let (root, run_id, alive, agent_watch) = {
+        let sessions = sessions.0.lock().map_err(|error| error.to_string())?;
+        let session = sessions.get(&session_id).ok_or("Session is not running")?;
+        let root = session
+            .child
+            .process_id()
+            .ok_or("Session has no process id")?;
+        (
+            sysinfo::Pid::from_u32(root),
+            session.run_id.clone(),
+            Arc::clone(&session.alive),
+            Arc::clone(&session.agent_watch),
+        )
+    };
+    thread::spawn(move || {
+        let discover = ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .without_tasks();
+        let mut system = System::new();
+        let mut processes = Vec::new();
+        for _ in 0..10 {
+            if !alive.load(Ordering::Relaxed) {
+                return;
+            }
+            system.refresh_processes_specifics(ProcessesToUpdate::All, true, discover);
+            processes = agent_descendants(&system, root, &agent);
+            if !processes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        if processes.is_empty() || !alive.load(Ordering::Relaxed) {
+            return;
+        }
+        let watch = agent_watch.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = app.emit(
+            "shell-agent",
+            ShellAgent {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                agent: Some(agent),
+            },
+        );
+        // Discovery is brief; a long-running agent retains and refreshes only its matching child PIDs.
+        system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&processes),
+            true,
+            ProcessRefreshKind::nothing().without_tasks(),
+        );
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            if !alive.load(Ordering::Relaxed) || agent_watch.load(Ordering::Relaxed) != watch {
+                return;
+            }
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&processes),
+                true,
+                ProcessRefreshKind::nothing().without_tasks(),
+            );
+            processes.retain(|pid| system.process(*pid).is_some());
+            if processes.is_empty() {
+                let _ = app.emit(
+                    "shell-agent",
+                    ShellAgent {
+                        session_id,
+                        run_id,
+                        agent: None,
+                    },
+                );
+                return;
+            }
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -2517,6 +2675,80 @@ async fn git_status(roots: State<'_, Roots>, root_id: String) -> Result<Option<G
     if !status.success() && !changes_truncated {
         return Err("Could not read Git status".into());
     }
+    let line_diffs = Command::new(&git)
+        .arg("-C")
+        .arg(&root)
+        .args(["diff", "--numstat", "-z", "HEAD"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            let stdout = child.stdout.take()?;
+            let mut output = Vec::new();
+            if stdout
+                .take(MAX_GIT_DIFF_BYTES + 1)
+                .read_to_end(&mut output)
+                .is_err()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            if output.len() > MAX_GIT_DIFF_BYTES as usize {
+                output.truncate(MAX_GIT_DIFF_BYTES as usize);
+                let _ = child.kill();
+                let _ = child.wait();
+            } else if !child.wait().ok()?.success() {
+                return None;
+            }
+            if output.last() != Some(&0) {
+                output.truncate(
+                    output
+                        .iter()
+                        .rposition(|byte| *byte == 0)
+                        .map_or(0, |i| i + 1),
+                );
+            }
+            Some(output)
+        })
+        .map(|output| {
+            let mut diffs = BTreeMap::<String, LineDiff>::new();
+            let mut records = output.split(|byte| *byte == 0);
+            while let Some(header) = records.next().filter(|record| !record.is_empty()) {
+                let mut fields = header.splitn(3, |byte| *byte == b'\t');
+                let Some(additions) = fields
+                    .next()
+                    .and_then(|value| String::from_utf8_lossy(value).parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                let Some(deletions) = fields
+                    .next()
+                    .and_then(|value| String::from_utf8_lossy(value).parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                let Some(path) = fields.next() else { continue };
+                // With -z, a rename leaves the header path empty and follows it with old and new paths.
+                let path = if path.is_empty() {
+                    let _ = records.next();
+                    records.next()
+                } else {
+                    Some(path)
+                };
+                let Some(path) = path else { continue };
+                diffs.insert(
+                    String::from_utf8_lossy(path).into_owned(),
+                    LineDiff {
+                        additions,
+                        deletions,
+                    },
+                );
+            }
+            diffs
+        })
+        .unwrap_or_default();
     Ok(Some(GitStatus {
         branch: if branch.is_empty() {
             "Detached HEAD".into()
@@ -2525,6 +2757,7 @@ async fn git_status(roots: State<'_, Roots>, root_id: String) -> Result<Option<G
         },
         worktree: root,
         changes,
+        line_diffs,
         changes_truncated,
     }))
 }
@@ -2779,6 +3012,18 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
     app.restart()
 }
 
+#[tauri::command]
+fn startup_ready(app: AppHandle) {
+    // Showing owns focus as well: a relaunch inherits no activation from the process an update replaced.
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    if let Some(window) = app.get_webview_window("splash") {
+        let _ = window.close();
+    }
+}
+
 // Tauri fills the About panel from the bundle config, which reaches it with only a name and version,
 // so the panel read as bare. macOS only: it is the one platform Tauri gives an application menu, and
 // setting one on Windows or Linux would put a native menu bar on a window that draws its own chrome.
@@ -2822,11 +3067,6 @@ pub fn run() {
             app.manage(load_roots(app.handle()));
             app.manage(load_provider_sessions(app.handle()));
             app.manage(load_codex_server(app.handle())?);
-            // A relaunch inherits no activation from the process it replaces, so the build installed
-            // by an update came back behind every other window with nothing to show it had finished.
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_focus();
-            }
             #[cfg(target_os = "macos")]
             describe_app(app.handle())?;
             Ok(())
@@ -2840,6 +3080,7 @@ pub fn run() {
             revoke_directory,
             spawn_session,
             write_session,
+            watch_shell_agent,
             resize_session,
             stop_session,
             delete_session_data,
@@ -2851,6 +3092,7 @@ pub fn run() {
             agent_availability,
             open_setup_docs,
             open_url,
+            open_directory,
             provider_auth,
             save_api_key,
             delete_api_key,
@@ -2860,7 +3102,8 @@ pub fn run() {
             grant_repo,
             local_repo,
             build_date,
-            local_update
+            local_update,
+            startup_ready
         ])
         .build(tauri::generate_context!())
         .expect("error while building Lite")

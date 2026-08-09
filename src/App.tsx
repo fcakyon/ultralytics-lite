@@ -30,6 +30,8 @@ import {
   TextSelect,
   Trash2,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import {
   Component,
@@ -44,7 +46,7 @@ import {
   useState,
 } from "react";
 
-import { LiteLogomark, ProviderIcon } from "@/brand-icons";
+import { ProviderIcon, UltralyticsLogomark } from "@/brand-icons";
 import { Badge } from "@/components/ui/badge";
 import { ActionIconButton, Button } from "@/components/ui/button";
 import {
@@ -85,7 +87,6 @@ import {
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Separator } from "@/components/ui/separator";
 import { Spinner } from "@/components/ui/spinner";
 import { Toaster, toast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -94,7 +95,7 @@ import { NewSessionDialog } from "@/new-session-dialog";
 import { appendOutput, clearOutput, subscribeOutput, syncTerminalTheme, writeSession } from "@/output-store";
 import { SettingsDialog } from "@/settings-dialog";
 import { applyTheme, initialTheme, type Theme } from "@/theme";
-import { type Session, sessionLabel } from "@/types";
+import { type Agent, type Session, sessionLabel } from "@/types";
 import "./App.css";
 
 const STORAGE_KEY = "lite.sessions.v1";
@@ -186,6 +187,9 @@ type AppMenuContext = {
   url: string;
   value: string;
   valueLabel: string;
+  zoomIn: HTMLButtonElement | null;
+  zoomOut: HTMLButtonElement | null;
+  zoomReset: HTMLButtonElement | null;
 };
 
 const EMPTY_MENU_CONTEXT: AppMenuContext = {
@@ -204,6 +208,9 @@ const EMPTY_MENU_CONTEXT: AppMenuContext = {
   url: "",
   value: "",
   valueLabel: "",
+  zoomIn: null,
+  zoomOut: null,
+  zoomReset: null,
 };
 
 function inputSelection(element: HTMLInputElement | HTMLTextAreaElement): string {
@@ -241,6 +248,9 @@ function menuContext(target: EventTarget | null): AppMenuContext {
     url: link instanceof HTMLAnchorElement ? link.href : (link?.dataset.contextUrl ?? ""),
     value: value?.dataset.contextValue ?? "",
     valueLabel: value?.dataset.contextLabel ?? "Copy",
+    zoomIn: session?.querySelector<HTMLButtonElement>("[data-context-zoom-in]") ?? null,
+    zoomOut: session?.querySelector<HTMLButtonElement>("[data-context-zoom-out]") ?? null,
+    zoomReset: session?.querySelector<HTMLButtonElement>("[data-context-zoom-reset]") ?? null,
   };
 }
 
@@ -253,6 +263,7 @@ function hasMenuItems(context: AppMenuContext): boolean {
     context.selectedText,
     context.sessionId,
     context.url || context.value,
+    context.zoomIn,
   ].some(Boolean);
 }
 
@@ -358,6 +369,26 @@ function AppContextMenu({
               <Trash2 />
               Close session
             </ContextMenuItem>
+            {context.zoomIn ? (
+              <>
+                <ContextMenuSeparator />
+                <ContextMenuItem onClick={() => context.zoomIn?.click()}>
+                  <ZoomIn />
+                  Zoom in
+                  <ContextMenuShortcut>{shortcut}+</ContextMenuShortcut>
+                </ContextMenuItem>
+                <ContextMenuItem onClick={() => context.zoomOut?.click()}>
+                  <ZoomOut />
+                  Zoom out
+                  <ContextMenuShortcut>{shortcut}-</ContextMenuShortcut>
+                </ContextMenuItem>
+                <ContextMenuItem onClick={() => context.zoomReset?.click()}>
+                  <RotateCcw />
+                  Actual size
+                  <ContextMenuShortcut>{shortcut}0</ContextMenuShortcut>
+                </ContextMenuItem>
+              </>
+            ) : null}
           </>
         ) : null}
         {context.url ? (
@@ -505,12 +536,14 @@ function VersionBadge({
   built,
   release,
   onCheck,
+  className,
 }: {
   version: string;
   commit: string | undefined;
   built: string;
   release: keyof typeof BADGE_VARIANT;
   onCheck: () => void;
+  className?: string;
 }) {
   if (!commit && !version) return null;
   return (
@@ -518,9 +551,11 @@ function VersionBadge({
       <TooltipTrigger
         render={
           <Badge
+            className={className}
             variant={commit ? "error" : BADGE_VARIANT[release]}
             render={<button type="button" onClick={onCheck} />}
           >
+            {!commit && release === "checking" ? <Spinner aria-hidden="true" /> : null}
             {commit || version}
           </Badge>
         }
@@ -592,11 +627,13 @@ class PanelBoundary extends Component<{ children: ReactNode }, { message: string
 // it collapses to show the same one, so a session is recognizable at either width.
 function SessionBadge({
   session,
+  agent = session.agent,
   active,
   starting,
   working,
 }: {
   session: Session;
+  agent?: Agent;
   active: boolean;
   starting: boolean;
   working: boolean;
@@ -605,7 +642,7 @@ function SessionBadge({
   const ring = active ? "ring-sidebar-accent" : "ring-sidebar";
   return (
     <span className="relative flex size-7 shrink-0 items-center justify-center rounded-md border bg-background">
-      <ProviderIcon agent={session.agent} provider={session.provider} />
+      <ProviderIcon agent={agent} provider={session.provider} />
       {starting ? (
         <Spinner
           className={`absolute -right-1 -bottom-1 size-3 rounded-full bg-background text-muted-foreground ring-2 ${ring}`}
@@ -630,8 +667,45 @@ function SessionMark({ session }: { session: Session }) {
   );
 }
 
+function SessionActionButtons({
+  name,
+  disabled = false,
+  onRestart,
+  onClose,
+}: {
+  name: string;
+  disabled?: boolean;
+  onRestart: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <>
+      <ActionIconButton
+        size="icon-sm"
+        tooltip="Restart"
+        aria-label={`Restart ${name}`}
+        disabled={disabled}
+        onClick={onRestart}
+      >
+        <RotateCcw />
+      </ActionIconButton>
+      <ActionIconButton
+        size="icon-sm"
+        className="hover:text-destructive"
+        tooltip="Close session"
+        aria-label={`Close ${name}`}
+        disabled={disabled}
+        onClick={onClose}
+      >
+        <Trash2 />
+      </ActionIconButton>
+    </>
+  );
+}
+
 function SessionRow({
   session,
+  agent,
   active,
   starting,
   working,
@@ -643,6 +717,7 @@ function SessionRow({
   onClose,
 }: {
   session: Session;
+  agent?: Agent;
   active: boolean;
   starting: boolean;
   working: boolean;
@@ -672,7 +747,7 @@ function SessionRow({
       className={`flex-nowrap transition-[color,background-color,opacity] active:opacity-70 ${active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/60"}`}
     >
       <ItemMedia>
-        <SessionBadge session={session} active={active} starting={starting} working={working} />
+        <SessionBadge session={session} agent={agent} active={active} starting={starting} working={working} />
       </ItemMedia>
       {renaming ? (
         <Input
@@ -718,25 +793,7 @@ function SessionRow({
         className="hidden shrink-0 gap-0.5 group-hover/item:flex group-focus-within/item:flex"
         onClick={(event) => event.stopPropagation()}
       >
-        <ActionIconButton
-          size="icon-sm"
-          tooltip="Restart"
-          aria-label={`Restart ${session.name}`}
-          disabled={starting}
-          onClick={onRestart}
-        >
-          <RotateCcw />
-        </ActionIconButton>
-        <ActionIconButton
-          size="icon-sm"
-          className="hover:text-destructive"
-          tooltip="Close session"
-          aria-label={`Close ${session.name}`}
-          disabled={starting}
-          onClick={onClose}
-        >
-          <Trash2 />
-        </ActionIconButton>
+        <SessionActionButtons name={session.name} disabled={starting} onRestart={onRestart} onClose={onClose} />
       </ItemActions>
     </Item>
   );
@@ -829,6 +886,17 @@ function subject(text: string) {
   return words.length > 40 ? `${words.slice(0, 40).trimEnd()}…` : words;
 }
 
+function commandAgent(command: string): Agent | undefined {
+  const executable = command
+    .trim()
+    .split(/\s+/, 1)[0]
+    ?.split(/[\\/]/)
+    .pop()
+    ?.replace(/\.exe$/i, "")
+    .toLowerCase();
+  return executable === "claude" || executable === "codex" || executable === "kimi" ? executable : undefined;
+}
+
 function App() {
   const [sessions, setSessions] = useState<Session[]>(loadSessions);
   const [selectedId, setSelectedId] = useState(() => sessions[0]?.id ?? "");
@@ -840,11 +908,13 @@ function App() {
   // Sessions whose terminal has written something recently, which is what separates a connected
   // session that is working from one that is merely connected.
   const [working, setWorking] = useState<Set<string>>(new Set());
+  const [shellAgents, setShellAgents] = useState<Map<string, Agent>>(new Map());
   const [query, setQuery] = useState("");
   const [renamingId, setRenamingId] = useState("");
   // Each side collapses to a rail of icons rather than to nothing, so the panel is still there to click
   // or drag back open. Dragging past the minimum is what collapses it; the handle never goes away.
   const [shut, setShut] = useState({ sidebar: false, inspector: false });
+  const layout = useRef<HTMLDivElement>(null);
   const sidebarPanel = useRef<PanelImperativeHandle>(null);
   const inspectorPanel = useRef<PanelImperativeHandle>(null);
   // The browse URL of the selected folder's origin, empty when it has none or Lite cannot open it.
@@ -865,6 +935,7 @@ function App() {
   const [availableVersion, setAvailableVersion] = useState("");
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [updateError, setUpdateError] = useState("");
+  const updateDialog = useRef<HTMLDivElement>(null);
   const runs = useRef(new Map<string, string>());
   const sessionsRef = useRef(sessions);
   const workTimers = useRef(new Map<string, number>());
@@ -896,6 +967,7 @@ function App() {
   // A drag reports every frame, so a side changes state only when the answer changes: handing back the
   // same object leaves React with nothing to redraw while the divider moves.
   const rail = useCallback((side: keyof typeof SIDES, size: { inPixels: number }) => {
+    layout.current?.style.setProperty(`--${side}-width`, `${size.inPixels}px`);
     const next = size.inPixels < SHUT;
     // A shut sidebar has nowhere to show a search field, so the filter closes with it rather than
     // leaving the rail and the number shortcuts counting two different lists.
@@ -906,6 +978,12 @@ function App() {
   // The inspector panel goes away with the last session and comes back at its default width, so what
   // the sides remember about it is reset with it rather than corrected by the first measurement.
   const hasSelection = Boolean(selected);
+  // The workspace starts hidden behind the splash. A committed App is ready to replace it, while
+  // restored sessions and the update check remain deliberately non-blocking.
+  useEffect(() => {
+    void invoke("startup_ready");
+  }, []);
+
   useEffect(() => {
     if (!hasSelection) setShut((current) => (current.inspector ? { ...current, inspector: false } : current));
   }, [hasSelection]);
@@ -1080,6 +1158,7 @@ function App() {
     let disposed = false;
     let unlistenOutput: (() => void) | undefined;
     let unlistenExit: (() => void) | undefined;
+    let unlistenAgent: (() => void) | undefined;
     void Promise.all([
       listen<{ sessionId: string; runId: string; data: number[] }>("pty-output", ({ payload }) => {
         if (runs.current.get(payload.sessionId) !== payload.runId) return;
@@ -1091,24 +1170,43 @@ function App() {
       listen<{ sessionId: string; runId: string }>("pty-exit", ({ payload }) => {
         if (runs.current.get(payload.sessionId) !== payload.runId) return;
         runs.current.delete(payload.sessionId);
+        setShellAgents((current) => {
+          if (!current.has(payload.sessionId)) return current;
+          const next = new Map(current);
+          next.delete(payload.sessionId);
+          return next;
+        });
         setSessions((current) =>
           current.map((session) => (session.id === payload.sessionId ? { ...session, running: false } : session)),
         );
       }),
-    ]).then(([output, exit]) => {
+      listen<{ sessionId: string; runId: string; agent: Agent | null }>("shell-agent", ({ payload }) => {
+        if (runs.current.get(payload.sessionId) !== payload.runId) return;
+        setShellAgents((current) => {
+          if (payload.agent === current.get(payload.sessionId)) return current;
+          const next = new Map(current);
+          if (payload.agent) next.set(payload.sessionId, payload.agent);
+          else next.delete(payload.sessionId);
+          return next;
+        });
+      }),
+    ]).then(([output, exit, agent]) => {
       if (disposed) {
         output();
         exit();
+        agent();
         return;
       }
       unlistenOutput = output;
       unlistenExit = exit;
+      unlistenAgent = agent;
     });
     const timers = workTimers.current;
     return () => {
       disposed = true;
       unlistenOutput?.();
       unlistenExit?.();
+      unlistenAgent?.();
       for (const timer of timers.values()) window.clearTimeout(timer);
       timers.clear();
     };
@@ -1405,65 +1503,90 @@ function App() {
         onRestartAll={() => void restartAllSessions()}
         onCloseAll={() => setClosingAll(true)}
       >
-        <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
+        <div ref={layout} className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
           {/* The window buttons sit inside this bar on macOS, so it doubles as the title bar and drags the window. */}
           <header
             data-tauri-drag-region
-            className="flex h-9 shrink-0 items-center gap-2 border-b bg-sidebar px-3 text-sidebar-foreground in-data-[titlebar=overlay]:pl-[86px]"
+            className="relative flex h-9 shrink-0 items-center border-b bg-sidebar text-sidebar-foreground"
           >
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    variant="ghost"
+            <div
+              className={`flex h-full shrink-0 items-center gap-[3px] overflow-hidden ${shut.sidebar ? "p-0" : "px-[13px] in-data-[titlebar=overlay]:pl-[86px]"}`}
+              style={{ width: shut.sidebar ? 0 : "var(--sidebar-width, 20%)" }}
+            >
+              {shut.sidebar ? null : (
+                <>
+                  <ActionIconButton
                     size="icon-sm"
+                    tooltip="View Lite on GitHub"
                     aria-label="Lite on GitHub"
                     data-context-url="https://github.com/ultralytics/lite"
                     onClick={() => void invoke("open_url", { url: "https://github.com/ultralytics/lite" })}
+                  >
+                    <UltralyticsLogomark className="size-[18px]" />
+                  </ActionIconButton>
+                  <VersionBadge
+                    className="h-[18px] px-1.5 text-[11px]"
+                    version={version}
+                    commit={commit}
+                    built={built}
+                    release={release}
+                    onCheck={() => void checkForUpdates()}
                   />
-                }
-              >
-                <LiteLogomark className="size-5" />
-              </TooltipTrigger>
-              <TooltipContent>View Lite on GitHub</TooltipContent>
-            </Tooltip>
-            <VersionBadge
-              version={version}
-              commit={commit}
-              built={built}
-              release={release}
-              onCheck={() => void checkForUpdates()}
-            />
+                </>
+              )}
+            </div>
+            <div
+              className={`flex h-full min-w-0 flex-1 items-center gap-2 pr-3 pl-[13px] ${shut.sidebar ? "in-data-[titlebar=overlay]:pl-[86px]" : ""}`}
+            >
+              {selected ? (
+                <>
+                  <ProviderIcon
+                    agent={shellAgents.get(selected.id) ?? selected.agent}
+                    provider={selected.provider}
+                    className="size-4 shrink-0"
+                  />
+                  <span className="min-w-0 truncate text-xs font-medium">{selected.name}</span>
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 overflow-hidden text-left font-mono text-[11px] text-muted-foreground hover:text-foreground"
+                    aria-label={`Open ${selected.cwd} in file browser`}
+                    onClick={() => void invoke("open_directory", { rootId: selected.rootId })}
+                  >
+                    <Tooltip>
+                      <TooltipTrigger render={<span className="block w-fit max-w-full truncate" />}>
+                        {selected.cwd}
+                      </TooltipTrigger>
+                      <TooltipContent>Open {selected.cwd} in file browser</TooltipContent>
+                    </Tooltip>
+                  </button>
+                </>
+              ) : (
+                <span className="text-sm font-semibold">Lite</span>
+              )}
+            </div>
             {selected ? (
-              <>
-                <Separator orientation="vertical" className="mx-1 h-4" />
-                <ProviderIcon agent={selected.agent} provider={selected.provider} />
-                <span className="min-w-0 truncate text-xs font-medium">{selected.name}</span>
-                <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{selected.cwd}</span>
+              <div className="relative h-full shrink-0" style={{ width: "var(--inspector-width, 25%)" }}>
                 {remote ? (
-                  <Tooltip>
-                    <TooltipTrigger
-                      render={
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="max-w-56 gap-1.5 text-muted-foreground"
-                          data-context-url={remote}
-                          onClick={() => void invoke("open_url", { url: remote })}
-                        />
-                      }
-                    >
-                      <GitBranch className="size-3.5 shrink-0" />
-                      <span className="truncate font-mono text-[11px]">{repoName(remote)}</span>
-                    </TooltipTrigger>
-                    <TooltipContent>Open {remote}</TooltipContent>
-                  </Tooltip>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className={`absolute top-0.5 right-20 min-w-0 gap-1.5 text-muted-foreground ${shut.inspector ? "max-w-56" : "left-[3px] justify-start"}`}
+                    data-context-url={remote}
+                    aria-label={`Open ${remote}`}
+                    onClick={() => void invoke("open_url", { url: remote })}
+                  >
+                    <GitBranch className="size-3.5 shrink-0" />
+                    <Tooltip>
+                      <TooltipTrigger render={<span className="min-w-0 truncate font-mono text-[11px]" />}>
+                        {repoName(remote)}
+                      </TooltipTrigger>
+                      <TooltipContent>Open {remote}</TooltipContent>
+                    </Tooltip>
+                  </Button>
                 ) : null}
-              </>
-            ) : (
-              <span className="text-sm font-semibold">Lite</span>
-            )}
-            <div className="ml-auto flex shrink-0 items-center gap-0.5">
+              </div>
+            ) : null}
+            <div className="absolute right-3 flex shrink-0 items-center gap-0.5">
               <Tooltip>
                 <TooltipTrigger
                   render={
@@ -1564,6 +1687,7 @@ function App() {
                           >
                             <SessionBadge
                               session={session}
+                              agent={shellAgents.get(session.id)}
                               active={session.id === selectedId}
                               starting={startingIds.has(session.id)}
                               working={working.has(session.id)}
@@ -1620,6 +1744,7 @@ function App() {
                           <SessionRow
                             key={session.id}
                             session={session}
+                            agent={shellAgents.get(session.id)}
                             active={session.id === selectedId}
                             starting={startingIds.has(session.id)}
                             working={working.has(session.id)}
@@ -1647,7 +1772,7 @@ function App() {
             <ResizablePanel defaultSize="55%" minSize="38%">
               <section className="flex h-full min-w-0 flex-col">
                 {selected ? (
-                  <div className="relative min-h-0 flex-1">
+                  <div data-terminal-surface className="relative min-h-0 flex-1">
                     <Suspense fallback={<div className="absolute inset-0 bg-background" />}>
                       {sessions.map((session) =>
                         session.running ? (
@@ -1660,32 +1785,38 @@ function App() {
                               sessionId={session.id}
                               theme={theme}
                               active={selected.running && session.id === selectedId}
-                              onPrompt={(text) =>
+                              onPrompt={(text) => {
+                                const agent = session.agent === "shell" ? commandAgent(text) : undefined;
+                                if (agent)
+                                  void invoke("watch_shell_agent", { sessionId: session.id, agent }).catch((reason) =>
+                                    console.error(`Lite could not follow the agent in session ${session.id}:`, reason),
+                                  );
                                 setSessions((current) =>
                                   current.map((item) =>
                                     item.id === session.id && !item.renamed && item.name === folderName(item.cwd)
                                       ? { ...item, name: subject(text) }
                                       : item,
                                   ),
-                                )
-                              }
+                                );
+                              }}
                             />
                           </div>
                         ) : null,
                       )}
                     </Suspense>
                     {selected.running ? (
-                      <ActionIconButton
-                        variant="outline"
-                        size="icon-sm"
-                        className="absolute top-2 right-2 z-10 bg-background/90 hover:text-destructive"
-                        tooltip="Close session"
-                        tooltipSide="left"
-                        aria-label={`Close ${selected.name}`}
-                        onClick={() => closeSession(selected)}
+                      <fieldset
+                        aria-label="Session actions"
+                        className="absolute top-2 right-2 z-10 hidden items-center gap-0.5"
+                        data-terminal-action
+                        onMouseDown={(event) => event.preventDefault()}
                       >
-                        <Trash2 />
-                      </ActionIconButton>
+                        <SessionActionButtons
+                          name={selected.name}
+                          onRestart={() => void restartSession(selected)}
+                          onClose={() => closeSession(selected)}
+                        />
+                      </fieldset>
                     ) : null}
                     {selected.running ? null : startingIds.has(selected.id) ? (
                       <Empty className="h-full">
@@ -1778,6 +1909,8 @@ function App() {
           </ResizablePanelGroup>
           <Dialog open={updateOpen} onOpenChange={changeUpdateOpen}>
             <DialogContent
+              ref={updateDialog}
+              initialFocus={updateDialog}
               className="sm:max-w-lg"
               showCloseButton={updateStatus !== "checking" && updateStatus !== "installing"}
             >
