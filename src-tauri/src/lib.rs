@@ -13,6 +13,7 @@ use std::{
     thread,
     time::{Duration, SystemTime},
 };
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_updater::UpdaterExt;
@@ -473,29 +474,133 @@ fn claude_session_exists(app: &AppHandle, session_id: &str) -> bool {
     })
 }
 
-fn claude_settings(app: &AppHandle, session_id: &str) -> Result<PathBuf, String> {
+fn claude_settings(app: &AppHandle, session_id: &str, run_id: &str) -> Result<PathBuf, String> {
     let directory = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
     let settings_path = directory.join(format!("claude-{session_id}.json"));
     let usage_path = directory.join(format!("usage-{session_id}.json"));
+    let activity_directory = directory.join(format!("activity-{session_id}"));
+    if activity_directory.exists() {
+        fs::remove_dir_all(&activity_directory).map_err(|error| error.to_string())?;
+    }
+    let activity_path = activity_directory.join(run_id);
+    fs::create_dir_all(&activity_path).map_err(|error| error.to_string())?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let command = format!(
-        "{} --claude-statusline {}",
+    let status = format!(
+        "{} --claude-statusline {} {}",
         shell_quote(&path_text(&executable)),
-        shell_quote(&path_text(&usage_path))
+        shell_quote(&path_text(&usage_path)),
+        shell_quote(&path_text(&activity_path))
+    );
+    let activity = format!(
+        "{} --claude-activity {}",
+        shell_quote(&path_text(&executable)),
+        shell_quote(&path_text(&activity_path))
     );
     write_atomic(
         &settings_path,
-        serde_json::json!({ "statusLine": { "type": "command", "command": command } })
-            .to_string()
-            .as_bytes(),
+        serde_json::json!({
+            "statusLine": { "type": "command", "command": status, "refreshInterval": 1 },
+            "hooks": {
+                "SubagentStart": [{ "hooks": [{ "type": "command", "command": activity }] }],
+                "SubagentStop": [{ "hooks": [{ "type": "command", "command": activity }] }]
+            }
+        })
+        .to_string()
+        .as_bytes(),
     )?;
     Ok(settings_path)
 }
 
-pub fn capture_claude_status(path: &str) -> Result<(), String> {
+fn activity_key(input: &serde_json::Value) -> Option<&str> {
+    input
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        })
+}
+
+pub fn capture_claude_activity(path: &str) -> Result<(), String> {
+    let input: serde_json::Value =
+        serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
+    let directory = Path::new(path);
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    let event = input
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match event {
+        "SubagentStart" => {
+            if let Some(key) = activity_key(&input) {
+                fs::write(directory.join(key), []).map_err(|error| error.to_string())?;
+            }
+        }
+        "SubagentStop" => {
+            if let Some(key) = activity_key(&input)
+                && let Err(error) = fs::remove_file(directory.join(key))
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(error.to_string());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn claude_shell_running() -> bool {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
+    let Ok(current) = sysinfo::get_current_pid() else {
+        return false;
+    };
+    let mut ancestors = HashSet::from([current]);
+    let mut parent = system.process(current).and_then(|process| process.parent());
+    let claude = loop {
+        let Some(pid) = parent else { return false };
+        ancestors.insert(pid);
+        let Some(process) = system.process(pid) else {
+            return false;
+        };
+        let name = process.name().to_string_lossy().to_ascii_lowercase();
+        if name.strip_suffix(".exe").unwrap_or(&name) == "claude" {
+            break pid;
+        }
+        parent = process.parent();
+    };
+    system.processes().iter().any(|(pid, process)| {
+        let name = process.name().to_string_lossy().to_ascii_lowercase();
+        if ancestors.contains(pid)
+            || !matches!(
+                name.strip_suffix(".exe").unwrap_or(&name),
+                "bash" | "cmd" | "dash" | "fish" | "nu" | "powershell" | "pwsh" | "sh" | "zsh"
+            )
+        {
+            return false;
+        }
+        let mut parent = process.parent();
+        while let Some(pid) = parent {
+            if pid == claude {
+                return true;
+            }
+            parent = system.process(pid).and_then(|process| process.parent());
+        }
+        false
+    })
+}
+
+pub fn capture_claude_status(path: &str, activity_path: &str) -> Result<(), String> {
     let input: serde_json::Value =
         serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
     let context = input
@@ -542,14 +647,17 @@ pub fn capture_claude_status(path: &str) -> Result<(), String> {
         lifetime_tokens: None,
         windows,
     };
-    write_atomic(
-        Path::new(path),
-        &serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?,
-    )?;
+    let usage = serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?;
+    if !fs::read(path).is_ok_and(|current| current == usage) {
+        write_atomic(Path::new(path), &usage)?;
+    }
+    let working = fs::read_dir(activity_path).is_ok_and(|mut entries| entries.next().is_some())
+        || claude_shell_running();
+    let activity = if working { "working" } else { "idle" };
     if let Some(percent) = snapshot.context_used_percent {
-        println!("Lite · {percent:.0}% context");
+        println!("\x1b]6973;lite-{activity}\x07Lite · {percent:.0}% context");
     } else {
-        println!("Lite");
+        println!("\x1b]6973;lite-{activity}\x07Lite");
     }
     Ok(())
 }
@@ -2049,7 +2157,7 @@ async fn spawn_session(
         )?
     };
     if !signing_in && agent == "claude" {
-        let settings = claude_settings(&app, &session_id)?;
+        let settings = claude_settings(&app, &session_id, &run_id)?;
         command.args(["--settings", &path_text(&settings)]);
     }
     command.cwd(path_text(&cwd));
@@ -2288,6 +2396,11 @@ fn delete_session_data(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
         }
+    }
+    if let Err(error) = fs::remove_dir_all(directory.join(format!("activity-{session_id}")))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.to_string());
     }
     update_provider_session(&app, &provider_sessions, &session_id, None).map(|_| ())
 }
