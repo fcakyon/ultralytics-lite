@@ -36,6 +36,7 @@ import {
   type LucideIcon,
   RefreshCw,
   Scale,
+  Search,
   X,
 } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -44,6 +45,7 @@ import { GitHubLogomark, ProviderIcon } from "@/brand-icons";
 import { Badge } from "@/components/ui/badge";
 import { ActionIconButton } from "@/components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader } from "@/components/ui/empty";
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Item, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemTitle } from "@/components/ui/item";
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -63,16 +65,27 @@ import {
 const CodePreview = lazy(() => import("@/code-preview"));
 
 // A session's terminal is the only record of what it worked on, so what it named is read back out of
-// the output Lite already keeps. Only what GitHub prints verbatim counts: a whole pull request or issue
-// link. A bare "#12" is as often a line number.
+// the output Lite already keeps: every whole pull request or issue link GitHub prints verbatim, and
+// every bare "#12" the conversation names one by. A bare number is a guess — it is as easily a line
+// number — so it is sent separately and only shown once GitHub confirms it names real work in the
+// session's own repository, which is the only repository a bare number can mean.
 // Only CSI is stripped, so a link inside an OSC hyperlink survives being uncoloured.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: a color code has to be named to be removed.
 const COLOR = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
 const GITHUB_ITEM = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:pull|issues)\/\d+/g;
+const BARE_ITEM = /(?:^|[^\w#])#([1-9]\d{0,8})(?!\w)/g;
 
-function namedInSession(sessionId: string) {
+function namedInSession(sessionId: string, remote: string) {
   const text = readOutput(sessionId).replace(COLOR, "");
-  return [...new Set(text.match(GITHUB_ITEM) ?? [])];
+  const urls = [...new Set(text.match(GITHUB_ITEM) ?? [])];
+  // A guess is spelled with the lowercase host the checker strips, however the remote cased it.
+  const prefix = "https://github.com/";
+  const base = remote.toLowerCase().startsWith(prefix) ? prefix + remote.slice(prefix.length) : "";
+  const numbers = new Set(base ? [...text.matchAll(BARE_ITEM)].map((match) => match[1]) : []);
+  for (const url of urls) {
+    if (url.toLowerCase().startsWith(`${base.toLowerCase()}/`)) numbers.delete(url.split("/").pop() ?? "");
+  }
+  return { urls, guessed: [...numbers].map((number) => `${base}/issues/${number}`) };
 }
 
 interface GitHubReference {
@@ -334,6 +347,37 @@ function Loading({ label }: { label: string }) {
   );
 }
 
+// The same field the sidebar searches sessions with, placed the same way: it names the panel it
+// narrows, and Escape empties it.
+function SearchInput({
+  value,
+  placeholder,
+  onChange,
+}: {
+  value: string;
+  placeholder: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="shrink-0 border-b p-2">
+      <InputGroup>
+        <InputGroupAddon>
+          <Search />
+        </InputGroupAddon>
+        <InputGroupInput
+          value={value}
+          placeholder={placeholder}
+          aria-label={placeholder}
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") onChange("");
+          }}
+        />
+      </InputGroup>
+    </div>
+  );
+}
+
 // A window that is nearly spent is the one thing here worth a color, so it recolors the bar it fills.
 function Meter({ label, value }: { label: string; value: number }) {
   const bounded = Math.max(0, Math.min(100, value));
@@ -348,7 +392,17 @@ function Meter({ label, value }: { label: string; value: number }) {
   );
 }
 
-function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOpen: (entry: FileEntry) => void }) {
+function FileTree({
+  root,
+  rootId,
+  query,
+  onOpen,
+}: {
+  root: string;
+  rootId: string;
+  query: string;
+  onOpen: (entry: FileEntry) => void;
+}) {
   const [children, setChildren] = useState<Record<string, DirectoryListing & { after: DirectoryCursor | null }>>({});
   // The root is the folder the session works in; showing it shut asks for a click to say what the
   // panel is already for, so it opens with the tree it was asked to show.
@@ -397,28 +451,40 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
     setExpanded(next);
   }
 
-  async function expandAll() {
+  // "Expand all" and search walk the same tree: the one loads it to open it, the other to look
+  // through it, and neither disturbs which folders were open once a search is cleared.
+  const walked = useRef(false);
+  async function walk(expand: boolean) {
     setExpandingAll(true);
     const nextChildren = { ...children };
-    const nextExpanded = new Set<string>();
+    const directories = new Set<string>();
     const pending = [root];
     try {
       while (pending.length) {
         const path = pending.shift();
-        if (!path || nextExpanded.has(path)) continue;
-        nextExpanded.add(path);
-        const cached = nextChildren[path];
-        const listing =
-          cached && !cached.after
-            ? cached
-            : { ...(await invoke<DirectoryListing>("list_directory", { rootId, path, after: null })), after: null };
-        nextChildren[path] = listing;
+        if (!path || directories.has(path)) continue;
+        directories.add(path);
+        // A directory is walked through every page it has: a walk that silently stopped at the first
+        // 250 entries would answer "No matches" about a file that exists.
+        let listing = nextChildren[path];
+        if (!listing || listing.after || listing.nextCursor) {
+          let entries: FileEntry[] = [];
+          let cursor: DirectoryCursor | null = null;
+          do {
+            const page: DirectoryListing = await invoke("list_directory", { rootId, path, after: cursor });
+            entries = entries.concat(page.entries);
+            cursor = page.nextCursor;
+          } while (cursor);
+          listing = { entries, nextCursor: null, after: null };
+          nextChildren[path] = listing;
+        }
         pending.push(
           ...listing.entries.filter((entry) => entry.isDirectory && !entry.isSymlink).map((entry) => entry.path),
         );
       }
       setChildren(nextChildren);
-      setExpanded(nextExpanded);
+      if (expand) setExpanded(directories);
+      walked.current = true;
       setError("");
     } catch (reason) {
       setError(String(reason));
@@ -427,44 +493,75 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
     }
   }
 
+  const lowered = query.trim().toLowerCase();
+
+  // A search has to see the whole tree, so the first searching keystroke loads it and the next query
+  // — not the render a failure causes — retries a walk that failed; one that succeeded is not
+  // repeated, and a cleared search forgets the failure so the same query asks again.
+  const attempted = useRef("");
+  useEffect(() => {
+    if (!lowered) attempted.current = "";
+    else if (lowered !== attempted.current && !walked.current && !expandingAll) {
+      attempted.current = lowered;
+      void walk(false);
+    }
+  });
+
+  // A folder is worth showing while searching if anything under it matches; only loaded listings can
+  // answer, which is what the walk above is for.
+  function subtreeMatches(path: string): boolean {
+    const listing = children[path];
+    return !!listing?.entries.some(
+      (entry) => entry.name.toLowerCase().includes(lowered) || (entry.isDirectory && subtreeMatches(entry.path)),
+    );
+  }
+
   function rows(path: string, depth = 0): React.ReactNode {
     const listing = children[path];
     if (!listing) {
       if (loadingPaths.has(path)) return <Loading label="Reading folder…" />;
       return error ? <p className="p-3 text-xs text-destructive">{error}</p> : null;
     }
+    const entries = lowered
+      ? listing.entries.filter(
+          (entry) => entry.name.toLowerCase().includes(lowered) || (entry.isDirectory && subtreeMatches(entry.path)),
+        )
+      : listing.entries;
     return (
       <>
-        {listing.entries.map((entry) => (
-          <div key={entry.path}>
-            <button
-              type="button"
-              className="flex h-7 w-full items-center gap-1.5 rounded-md pr-2 text-left text-xs hover:bg-muted"
-              style={{ paddingLeft: `${8 + depth * 14}px` }}
-              data-context-value={entry.path}
-              data-context-label="Copy path"
-              data-context-directory={entry.isDirectory ? "" : undefined}
-              data-context-expanded={entry.isDirectory ? expanded.has(entry.path) : undefined}
-              onClick={() => (entry.isDirectory ? void toggle(entry.path) : onOpen(entry))}
-            >
-              {entry.isDirectory ? (
-                <>
-                  <ChevronRight
-                    className={`size-3.5 text-muted-foreground transition-transform ${expanded.has(entry.path) ? "rotate-90" : ""}`}
-                  />
-                  <FileIcon name={entry.name} directory />
-                </>
-              ) : (
-                <>
-                  <span className="w-3.5" />
-                  <FileIcon name={entry.name} />
-                </>
-              )}
-              <span className="truncate">{entry.name}</span>
-            </button>
-            {entry.isDirectory && expanded.has(entry.path) ? rows(entry.path, depth + 1) : null}
-          </div>
-        ))}
+        {entries.map((entry) => {
+          const open = entry.isDirectory && (expanded.has(entry.path) || (!!lowered && subtreeMatches(entry.path)));
+          return (
+            <div key={entry.path}>
+              <button
+                type="button"
+                className="flex h-7 w-full items-center gap-1.5 rounded-md pr-2 text-left text-xs hover:bg-muted"
+                style={{ paddingLeft: `${8 + depth * 14}px` }}
+                data-context-value={entry.path}
+                data-context-label="Copy path"
+                data-context-directory={entry.isDirectory ? "" : undefined}
+                data-context-expanded={entry.isDirectory ? expanded.has(entry.path) : undefined}
+                onClick={() => (entry.isDirectory ? void toggle(entry.path) : onOpen(entry))}
+              >
+                {entry.isDirectory ? (
+                  <>
+                    <ChevronRight
+                      className={`size-3.5 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
+                    />
+                    <FileIcon name={entry.name} directory />
+                  </>
+                ) : (
+                  <>
+                    <span className="w-3.5" />
+                    <FileIcon name={entry.name} />
+                  </>
+                )}
+                <span className="truncate">{entry.name}</span>
+              </button>
+              {open ? rows(entry.path, depth + 1) : null}
+            </div>
+          );
+        })}
         {listing.after || listing.nextCursor ? (
           <div className="flex h-7 items-center gap-3 pr-2 text-xs" style={{ paddingLeft: `${30 + depth * 14}px` }}>
             {listing.after ? (
@@ -494,6 +591,7 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
 
   const parts = root.split(/[\\/]/).filter(Boolean);
   const name = parts[parts.length - 1] ?? root;
+  const rootOpen = !!lowered || expanded.has(root);
   return (
     <div className="py-2">
       <div className="flex items-center pr-1">
@@ -507,7 +605,7 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
           onClick={() => void toggle(root)}
         >
           <ChevronRight
-            className={`size-3.5 text-muted-foreground transition-transform ${expanded.has(root) ? "rotate-90" : ""}`}
+            className={`size-3.5 text-muted-foreground transition-transform ${rootOpen ? "rotate-90" : ""}`}
           />
           <FileIcon name={name} directory />
           <span className="truncate">{name}</span>
@@ -518,7 +616,7 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
           aria-label="Expand all folders"
           data-context-expand-files
           disabled={expandingAll}
-          onClick={() => void expandAll()}
+          onClick={() => void walk(true)}
         >
           {expandingAll ? <Spinner /> : <ChevronsUpDown />}
         </ActionIconButton>
@@ -533,7 +631,12 @@ function FileTree({ root, rootId, onOpen }: { root: string; rootId: string; onOp
           <ChevronsDownUp />
         </ActionIconButton>
       </div>
-      {expanded.has(root) ? rows(root, 1) : null}
+      {/* A walk that failed searched a partial tree, so its error shows over whatever it did find. */}
+      {lowered && error ? <p className="p-3 text-xs text-destructive">{error}</p> : null}
+      {lowered && !error && !expandingAll && children[root] && !subtreeMatches(root) ? (
+        <p className="px-3 py-2 text-xs text-muted-foreground">No matches</p>
+      ) : null}
+      {rootOpen ? rows(root, 1) : null}
     </div>
   );
 }
@@ -542,6 +645,7 @@ function FilesPanel({ root, rootId }: { root: string; rootId: string }) {
   const [selected, setSelected] = useState<FileEntry | null>(null);
   const [source, setSource] = useState("");
   const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
 
   async function openFile(entry: FileEntry) {
     setSelected(entry);
@@ -583,8 +687,9 @@ function FilesPanel({ root, rootId }: { root: string; rootId: string }) {
   }
   return (
     <div data-context-files className="flex h-full min-h-0 flex-col">
+      <SearchInput value={query} placeholder="Search files" onChange={setQuery} />
       <ScrollArea className="min-h-0 flex-1">
-        <FileTree root={root} rootId={rootId} onOpen={(entry) => void openFile(entry)} />
+        <FileTree root={root} rootId={rootId} query={query} onOpen={(entry) => void openFile(entry)} />
       </ScrollArea>
     </div>
   );
@@ -664,23 +769,28 @@ export function clearUsageCache(sessionId: string) {
 function GitPanel({ rootId, sessionId, remote }: { rootId: string; sessionId: string; remote: string }) {
   // Read once when the panel is built, like every other thing this panel shows: the refresh button
   // rebuilds it, and nothing here watches the session between those two moments.
-  const named = useMemo(() => namedInSession(sessionId), [sessionId]);
+  const named = useMemo(() => namedInSession(sessionId, remote), [sessionId, remote]);
   const [status, setStatus] = useState<GitStatus | null>();
   const [items, setItems] = useState<GitHubItem[]>();
   const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
 
   // The panel is only built when the tab is opened and again whenever it is refreshed, so asking
   // GitHub here asks it exactly on those two occasions and never between them.
   useEffect(() => {
-    if (!named.length) return setItems([]);
+    if (!named.urls.length && !named.guessed.length) return setItems([]);
     let disposed = false;
-    void invoke<GitHubItem[]>("github_items", { urls: named })
+    // A remote that arrives after an empty first pass starts a real check, so the panel goes back to
+    // checking rather than staying empty without a word.
+    setItems(undefined);
+    void invoke<GitHubItem[]>("github_items", { urls: named.urls, guessed: named.guessed })
       .then((checked) => {
         if (!disposed) setItems(checked);
       })
-      // A link that could not be checked is still a link, so it is shown the way it was printed.
+      // A link that could not be checked is still a link, so it is shown the way it was printed; a
+      // guessed number without GitHub's confirmation is not.
       .catch(() => {
-        if (!disposed) setItems(named.map((url) => ({ url, title: null, state: null, occurredAt: null })));
+        if (!disposed) setItems(named.urls.map((url) => ({ url, title: null, state: null, occurredAt: null })));
       });
     return () => {
       disposed = true;
@@ -701,17 +811,40 @@ function GitPanel({ rootId, sessionId, remote }: { rootId: string; sessionId: st
   }, [refresh]);
 
   const repositories = repositoryGroups(remote, status ?? null, items ?? []);
+  // Searching narrows each card to what matches — a changed path, an item's title or number, or the
+  // repository's own name — and drops the cards left holding nothing.
+  const lowered = query.trim().toLowerCase();
+  const shown = lowered
+    ? repositories
+        .map((repository) => ({
+          ...repository,
+          changes: repository.changes.filter((change) => change.slice(3).toLowerCase().includes(lowered)),
+          items: repository.items.filter(
+            (item) => `#${item.number}`.includes(lowered) || item.title?.toLowerCase().includes(lowered),
+          ),
+        }))
+        .filter(
+          (repository) =>
+            repository.name.toLowerCase().includes(lowered) || repository.changes.length || repository.items.length,
+        )
+    : repositories;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      <SearchInput value={query} placeholder="Search changes and items" onChange={setQuery} />
       <ScrollArea className="min-h-0 flex-1">
         <div className="flex flex-col gap-3 p-3">
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
           {!error && status === undefined ? <Loading label="Reading Git status…" /> : null}
-          {repositories.map((repository) => (
+          {shown.map((repository) => (
             <RepositoryCard key={(repository.url ?? repository.path)?.toLowerCase()} repository={repository} />
           ))}
-          {items === undefined && named.length ? <Loading label="Checking GitHub links…" /> : null}
+          {lowered && status !== undefined && items && repositories.length && !shown.length ? (
+            <p className="text-sm text-muted-foreground">No matches</p>
+          ) : null}
+          {items === undefined && (named.urls.length || named.guessed.length) ? (
+            <Loading label="Checking GitHub links…" />
+          ) : null}
           {status === null && items && !repositories.length ? (
             <Empty>
               <EmptyHeader>
