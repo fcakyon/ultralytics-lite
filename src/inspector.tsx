@@ -651,44 +651,70 @@ function RepositoryCard({ repository }: { repository: RepositoryGroup }) {
   );
 }
 
+// Revisiting a session paints its last small metadata snapshot immediately, then the mounted panel
+// rereads the owner in the background. File contents stay out of these caches.
+const gitStatusCache = new Map<string, GitStatus | null>();
+const githubItemsCache = new Map<string, GitHubItem[]>();
+const usageCache = new Map<string, UsageSnapshot | null>();
+
+export function clearInspectorCache(sessionId: string, rootId: string) {
+  gitStatusCache.delete(rootId);
+  githubItemsCache.delete(sessionId);
+  usageCache.delete(sessionId);
+}
+
 function GitPanel({ rootId, sessionId, remote }: { rootId: string; sessionId: string; remote: string }) {
-  // Read once when the panel is built, like every other thing this panel shows: the refresh button
-  // rebuilds it, and nothing here watches the session between those two moments.
+  // A mount revalidates the cached snapshot, and the refresh button mounts the panel again. Nothing
+  // watches Git or GitHub between those explicit reads.
   const named = useMemo(() => namedInSession(sessionId), [sessionId]);
-  const [status, setStatus] = useState<GitStatus | null>();
-  const [items, setItems] = useState<GitHubItem[]>();
+  const [status, setStatus] = useState<GitStatus | null | undefined>(() => gitStatusCache.get(rootId));
+  const [items, setItems] = useState<GitHubItem[] | undefined>(() => githubItemsCache.get(sessionId));
   const [error, setError] = useState("");
 
-  // The panel is only built when the tab is opened and again whenever it is refreshed, so asking
-  // GitHub here asks it exactly on those two occasions and never between them.
+  // Asking GitHub on mount updates the stale snapshot already painted above.
   useEffect(() => {
-    if (!named.length) return setItems([]);
+    if (!named.length) {
+      githubItemsCache.set(sessionId, []);
+      return setItems([]);
+    }
     let disposed = false;
     void invoke<GitHubItem[]>("github_items", { urls: named })
       .then((checked) => {
-        if (!disposed) setItems(checked);
+        if (!disposed) {
+          githubItemsCache.set(sessionId, checked);
+          setItems(checked);
+        }
       })
       // A link that could not be checked is still a link, so it is shown the way it was printed.
       .catch(() => {
-        if (!disposed) setItems(named.map((url) => ({ url, title: null, state: null, occurredAt: null })));
+        if (!disposed) {
+          const unchecked = named.map((url) => ({ url, title: null, state: null, occurredAt: null }));
+          githubItemsCache.set(sessionId, unchecked);
+          setItems(unchecked);
+        }
       });
     return () => {
       disposed = true;
     };
-  }, [named]);
-
-  const refresh = useCallback(async () => {
-    setError("");
-    try {
-      setStatus(await invoke<GitStatus | null>("git_status", { rootId }));
-    } catch (reason) {
-      setError(String(reason));
-    }
-  }, [rootId]);
+  }, [named, sessionId]);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    let disposed = false;
+    setError("");
+    void invoke<GitStatus | null>("git_status", { rootId })
+      .then((next) => {
+        if (!disposed) {
+          gitStatusCache.set(rootId, next);
+          setStatus(next);
+        }
+      })
+      .catch((reason) => {
+        if (!disposed) setError(String(reason));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [rootId]);
 
   const repositories = repositoryGroups(remote, status ?? null, items ?? []);
 
@@ -728,27 +754,30 @@ function missingUsage(session: Session): string {
 }
 
 function UsagePanel({ session }: { session: Session }) {
-  const [usage, setUsage] = useState<UsageSnapshot | null>();
+  const [usage, setUsage] = useState<UsageSnapshot | null | undefined>(() => usageCache.get(session.id));
   const [error, setError] = useState("");
 
-  const refresh = useCallback(async () => {
-    setError("");
-    try {
-      setUsage(
-        await invoke<UsageSnapshot | null>("read_usage", {
-          agent: session.agent,
-          provider: session.provider,
-          sessionId: session.id,
-        }),
-      );
-    } catch (reason) {
-      setError(String(reason));
-    }
-  }, [session.agent, session.provider, session.id]);
-
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    let disposed = false;
+    setError("");
+    void invoke<UsageSnapshot | null>("read_usage", {
+      agent: session.agent,
+      provider: session.provider,
+      sessionId: session.id,
+    })
+      .then((next) => {
+        if (!disposed) {
+          usageCache.set(session.id, next);
+          setUsage(next);
+        }
+      })
+      .catch((reason) => {
+        if (!disposed) setError(String(reason));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [session.agent, session.provider, session.id]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">

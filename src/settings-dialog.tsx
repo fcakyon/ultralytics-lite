@@ -1,7 +1,7 @@
 // Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import { invoke } from "@tauri-apps/api/core";
-import { Check, Eye, EyeOff, Trash2 } from "lucide-react";
+import { Eye, EyeOff, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 import { ProviderIcon } from "@/brand-icons";
@@ -17,70 +17,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
-import {
-  Item,
-  ItemActions,
-  ItemContent,
-  ItemDescription,
-  ItemFooter,
-  ItemGroup,
-  ItemMedia,
-  ItemTitle,
-} from "@/components/ui/item";
+import { Item, ItemActions, ItemContent, ItemFooter, ItemGroup, ItemMedia, ItemTitle } from "@/components/ui/item";
 import { Spinner } from "@/components/ui/spinner";
-import type { Agent, ModelProvider } from "@/types";
+import { AUTH_PROVIDERS, type ProviderAuth, ProviderAuthDescription } from "@/provider-auth";
+import type { Agent } from "@/types";
 
 // Each CLI signs in on its own; a key here is the alternative for anyone who would rather not.
-const providers: {
-  id: string;
-  agent: Agent;
-  provider?: ModelProvider;
-  label: string;
-  variable: string;
-  signedIn: string;
-  signIn: boolean;
-}[] = [
-  {
-    id: "claude",
-    agent: "claude",
-    label: "Anthropic",
-    variable: "ANTHROPIC_API_KEY",
-    signedIn: "Signed in through Claude Code",
-    signIn: true,
-  },
-  {
-    id: "codex",
-    agent: "codex",
-    provider: "openai",
-    label: "OpenAI",
-    variable: "OPENAI_API_KEY",
-    signedIn: "Signed in through Codex",
-    signIn: true,
-  },
-  {
-    id: "deepseek",
-    agent: "codex",
-    provider: "deepseek",
-    label: "DeepSeek",
-    variable: "DEEPSEEK_API_KEY",
-    signedIn: "Configured in your Codex settings",
-    signIn: false,
-  },
-  {
-    id: "kimi",
-    agent: "kimi",
-    label: "Moonshot",
-    variable: "MOONSHOT_API_KEY",
-    signedIn: "Configured in Kimi Code",
-    signIn: true,
-  },
-];
-
-interface ProviderAuth {
-  name: string;
-  keyHint: string | null;
-  cliSignedIn: boolean;
-}
+const providers = Object.values(AUTH_PROVIDERS);
 
 export function SettingsDialog({
   open: isOpen,
@@ -164,8 +107,8 @@ export function SettingsDialog({
         <DialogHeader>
           <DialogTitle>API keys</DialogTitle>
           <DialogDescription>
-            Sessions use the key saved here when one exists, and the provider's own sign-in when it does not. Keys stay
-            on this computer in Lite's data folder and reach a session through its provider's environment variable.
+            Each row shows how new sessions sign in. API keys saved here stay on this computer and take priority over
+            provider sign-in.
           </DialogDescription>
         </DialogHeader>
         <DialogBody>
@@ -187,35 +130,19 @@ export function SettingsDialog({
                         {option.variable}
                       </Badge>
                     </ItemTitle>
-                    <ItemDescription>
-                      {status?.keyHint ? (
-                        <span className="flex items-center gap-1.5">
-                          <Check className="size-3.5 shrink-0" />
-                          Key saved
-                          <span className="font-mono">••••{status.keyHint}</span>
-                        </span>
-                      ) : status ? (
-                        status.cliSignedIn ? (
-                          option.signedIn
-                        ) : (
-                          "Not set up"
-                        )
-                      ) : (
-                        "Checking…"
-                      )}
-                    </ItemDescription>
+                    <ProviderAuthDescription provider={option} status={status} />
                   </ItemContent>
                   {open ? null : (
                     <ItemActions>
-                      {!status?.keyHint && !status?.cliSignedIn && option.signIn ? (
+                      {!status?.keyHint && !status?.cliAuthMethod && option.signIn ? (
                         <Button variant="outline" size="sm" onClick={() => onSignIn(option.agent)}>
                           Sign in
                         </Button>
                       ) : null}
                       <Button variant="ghost" size="sm" onClick={() => edit(option.id, true)}>
-                        {status?.keyHint ? "Replace" : "Use a key"}
+                        {status?.keyHint || status?.cliAuthMethod === "apiKey" ? "Replace API key" : "Use API key"}
                       </Button>
-                      {status?.keyHint ? (
+                      {status?.keyHint || status?.cliKeyHint ? (
                         <ActionIconButton
                           size="icon-sm"
                           className="hover:text-destructive"

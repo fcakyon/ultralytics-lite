@@ -1328,13 +1328,132 @@ fn claude_signed_in(app: &AppHandle) -> bool {
     }
 }
 
-fn cli_signed_in(app: &AppHandle, name: &str) -> bool {
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum CliAuthMethod {
+    Provider,
+    ApiKey,
+}
+
+struct CliAuth {
+    method: CliAuthMethod,
+    key_hint: Option<String>,
+}
+
+fn key_hint(key: &str) -> String {
+    let key = key.trim();
+    key.chars()
+        .skip(key.chars().count().saturating_sub(4))
+        .collect()
+}
+
+fn kimi_provider_name(config: &toml_edit::DocumentMut) -> Option<String> {
+    let model = config.get("default_model")?.as_str()?;
+    config
+        .get("models")?
+        .get(model)?
+        .get("provider")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn kimi_env_api_key(provider: &dyn toml_edit::TableLike) -> Option<&'static str> {
+    match provider.get("type")?.as_str()? {
+        "kimi" => Some("KIMI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" | "openai_responses" => Some("OPENAI_API_KEY"),
+        "google-genai" => Some("GOOGLE_API_KEY"),
+        "vertexai" => Some("VERTEXAI_API_KEY"),
+        _ => None,
+    }
+}
+
+fn kimi_auth(app: &AppHandle) -> Option<CliAuth> {
+    let config = fs::read_to_string(kimi_home(app).ok()?.join("config.toml")).ok()?;
+    let config = config.parse::<toml_edit::DocumentMut>().ok()?;
+    let provider = kimi_provider_name(&config)?;
+    let provider = config.get("providers")?.get(&provider)?.as_table_like()?;
+
+    let api_key = provider
+        .get("api_key")
+        .and_then(toml_edit::Item::as_str)
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| {
+            let name = kimi_env_api_key(provider)?;
+            provider
+                .get("env")
+                .and_then(toml_edit::Item::as_table_like)
+                .and_then(|env| env.get(name))
+                .and_then(toml_edit::Item::as_str)
+                .filter(|key| !key.trim().is_empty())
+        });
+    if let Some(api_key) = api_key {
+        Some(CliAuth {
+            method: CliAuthMethod::ApiKey,
+            key_hint: Some(key_hint(api_key)),
+        })
+    } else if provider.get("oauth").is_some() {
+        Some(CliAuth {
+            method: CliAuthMethod::Provider,
+            key_hint: None,
+        })
+    } else {
+        None
+    }
+}
+
+fn delete_kimi_api_key(app: &AppHandle) -> Result<(), String> {
+    let path = kimi_home(app)?.join("config.toml");
+    let permissions = fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let mut config = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| error.to_string())?;
+    let provider = kimi_provider_name(&config).ok_or("Kimi's default provider is missing")?;
+    let provider = config
+        .get_mut("providers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|providers| providers.get_mut(&provider))
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or("Kimi's default provider is missing")?;
+
+    let env_api_key = kimi_env_api_key(provider);
+    let removed_env = env_api_key.is_some_and(|name| {
+        provider
+            .get_mut("env")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .is_some_and(|env| env.remove(name).is_some())
+    });
+    let removed = provider.remove("api_key").is_some() || removed_env;
+    if removed {
+        write_atomic(&path, config.to_string().as_bytes())?;
+        fs::set_permissions(&path, permissions).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn cli_auth(app: &AppHandle, name: &str) -> Option<CliAuth> {
     match name {
-        "claude" => claude_signed_in(app),
-        "codex" => codex_home(app).is_ok_and(|home| home.join("auth.json").is_file()),
-        "deepseek" => deepseek_profile_exists(app) || codex_declares_deepseek(app),
-        "kimi" => kimi_home(app).is_ok_and(|home| home.join("config.toml").is_file()),
-        _ => false,
+        "claude" => claude_signed_in(app).then_some(CliAuth {
+            method: CliAuthMethod::Provider,
+            key_hint: None,
+        }),
+        "codex" => codex_home(app)
+            .is_ok_and(|home| home.join("auth.json").is_file())
+            .then_some(CliAuth {
+                method: CliAuthMethod::Provider,
+                key_hint: None,
+            }),
+        "deepseek" => {
+            (deepseek_profile_exists(app) || codex_declares_deepseek(app)).then_some(CliAuth {
+                method: CliAuthMethod::ApiKey,
+                key_hint: None,
+            })
+        }
+        "kimi" => kimi_auth(app),
+        _ => None,
     }
 }
 
@@ -1343,7 +1462,8 @@ fn cli_signed_in(app: &AppHandle, name: &str) -> bool {
 struct ProviderAuth {
     name: String,
     key_hint: Option<String>,
-    cli_signed_in: bool,
+    cli_auth_method: Option<CliAuthMethod>,
+    cli_key_hint: Option<String>,
 }
 
 #[tauri::command]
@@ -1351,15 +1471,15 @@ async fn provider_auth(app: AppHandle) -> Result<Vec<ProviderAuth>, String> {
     let keys = load_api_keys(&app);
     Ok(SUPPORTED_KEYS
         .iter()
-        .map(|name| ProviderAuth {
-            name: (*name).to_owned(),
-            // Only the last characters travel to the interface, enough to tell two keys apart.
-            key_hint: keys.get(*name).map(|key| {
-                key.chars()
-                    .skip(key.chars().count().saturating_sub(4))
-                    .collect()
-            }),
-            cli_signed_in: cli_signed_in(&app, name),
+        .map(|name| {
+            let cli_auth = cli_auth(&app, name);
+            ProviderAuth {
+                name: (*name).to_owned(),
+                // Only the last characters travel to the interface, enough to tell two keys apart.
+                key_hint: keys.get(*name).map(|key| key_hint(key)),
+                cli_auth_method: cli_auth.as_ref().map(|auth| auth.method),
+                cli_key_hint: cli_auth.and_then(|auth| auth.key_hint),
+            }
         })
         .collect())
 }
@@ -1381,10 +1501,13 @@ async fn save_api_key(app: AppHandle, name: String, key: String) -> Result<(), S
 #[tauri::command]
 async fn delete_api_key(app: AppHandle, name: String) -> Result<(), String> {
     let mut keys = load_api_keys(&app);
-    if keys.remove(&name).is_none() {
-        return Ok(());
+    if keys.remove(&name).is_some() {
+        return write_api_keys(&app, &keys);
     }
-    write_api_keys(&app, &keys)
+    if name == "kimi" {
+        return delete_kimi_api_key(&app);
+    }
+    Ok(())
 }
 
 // A launched app inherits a bare PATH, and the PATH given to a child is not used to find the program
