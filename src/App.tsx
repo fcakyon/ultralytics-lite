@@ -1455,7 +1455,7 @@ function App() {
       };
       setUpdateOpen(false);
       createSession(session);
-      runOnStart(session.id, "bun run local");
+      runOnStart(session.id, "git pull --ff-only origin main && bun run local");
     } catch (reason) {
       setRebuilding(false);
       setUpdateError(String(reason));
@@ -1506,7 +1506,7 @@ function App() {
         <div ref={layout} className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
           {/* The window buttons sit inside this bar on macOS, so it doubles as the title bar and drags the window. */}
           <header
-            data-tauri-drag-region
+            data-tauri-drag-region="deep"
             className="relative flex h-9 shrink-0 items-center border-b bg-sidebar text-sidebar-foreground"
           >
             <div
@@ -1548,7 +1548,7 @@ function App() {
                   <span className="min-w-0 truncate text-xs font-medium">{selected.name}</span>
                   <button
                     type="button"
-                    className="min-w-0 flex-1 overflow-hidden text-left font-mono text-[11px] text-muted-foreground hover:text-foreground"
+                    className="min-w-0 max-w-full overflow-hidden text-left font-mono text-[11px] text-muted-foreground hover:text-foreground"
                     aria-label={`Open ${selected.cwd} in file browser`}
                     onClick={() => void invoke("open_directory", { rootId: selected.rootId })}
                   >
@@ -1570,7 +1570,7 @@ function App() {
                   <Button
                     variant="ghost"
                     size="sm"
-                    className={`absolute top-0.5 right-20 min-w-0 gap-1.5 text-muted-foreground ${shut.inspector ? "max-w-56" : "left-[3px] justify-start"}`}
+                    className={`absolute top-0.5 right-20 min-w-0 gap-1.5 text-muted-foreground ${shut.inspector ? "max-w-56" : "max-w-[calc(100%-5.75rem)]"}`}
                     data-context-url={remote}
                     aria-label={`Open ${remote}`}
                     onClick={() => void invoke("open_url", { url: remote })}
@@ -1935,7 +1935,7 @@ function App() {
                     ? `Lite ${availableVersion} is ready. Updating stops running sessions; their tabs resume after restart.`
                     : null}
                   {updateStatus === "rebuild"
-                    ? `This build is ${commit} and the tree is now ${availableVersion}. Rebuilding runs bun run local in a shell tab, and replaces this build when it finishes.`
+                    ? `This build is ${commit} and main is now ${availableVersion}. Rebuilding fast-forwards from origin/main in a shell tab, then replaces this build.`
                     : null}
                   {updateStatus === "current" ? (
                     <span className="flex items-center gap-1.5">
