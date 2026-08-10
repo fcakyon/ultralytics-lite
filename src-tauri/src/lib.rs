@@ -2304,6 +2304,8 @@ fn agent_command(
             let mut command = CommandBuilder::new_default_prog();
             #[cfg(target_os = "macos")]
             command.env("TERM_PROGRAM", "Apple_Terminal");
+            #[cfg(target_os = "macos")]
+            command.env("TERM_SESSION_ID", session_id);
             command
         }
         _ => return Err("Unknown session type".into()),
