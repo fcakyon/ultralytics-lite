@@ -22,10 +22,7 @@ import { Switch } from "@/components/ui/switch";
 import { AUTH_PROVIDERS, type ProviderAuth, ProviderAuthDescription } from "@/provider-auth";
 import { defaultSessionName, type Session, sessionLabel } from "@/types";
 
-const choices = [
-  ...Object.values(AUTH_PROVIDERS),
-  { id: "shell", agent: "shell" as const, provider: undefined, description: "Open your default shell" },
-];
+const choices = [...Object.values(AUTH_PROVIDERS), { id: "shell", agent: "shell" as const, provider: undefined }];
 const harnesses = [...new Set(choices.map((option) => option.agent).filter((agent) => agent !== "shell"))];
 
 // The quiet heading that separates the two questions the dialog asks, in the sidebar's own label style.
@@ -403,7 +400,18 @@ export function NewSessionDialog({
                   const state = availability[option.id];
                   const update = updates[option.agent];
                   const managed = option.agent !== "shell" && state && !state.installable;
-                  const installable = state?.installable;
+                  // A registry that could not answer knows of no update, so only one it reported is
+                  // offered — by the button and by the mark beside the version alike.
+                  const updatable = managed && update === true;
+                  // What the button offers, if it is there at all, and the room the tile keeps for it:
+                  // a tile only ever offers the one action, so each reserves the width of its own
+                  // widest label rather than both settling for the wider.
+                  const action = state?.installable
+                    ? ({ label: "Install", working: "Installing…", room: "pr-28" } as const)
+                    : updatable
+                      ? ({ label: "Update", working: "Updating…", room: "pr-24" } as const)
+                      : undefined;
+                  const busy = installing === option.id;
                   const authProvider = "configured" in option ? option : undefined;
                   const authStatus = authProvider ? auth?.find((entry) => entry.name === authProvider.id) : undefined;
                   return (
@@ -412,7 +420,7 @@ export function NewSessionDialog({
                         type="button"
                         size="lg"
                         variant={active ? "secondary" : "outline"}
-                        className={`h-14 w-full min-w-0 justify-start overflow-hidden pl-3 ${installable ? "pr-20" : managed && update !== false && update !== undefined ? "pr-24" : "pr-3"}`}
+                        className={`h-14 w-full min-w-0 justify-start overflow-hidden pl-3 ${action?.room ?? "pr-3"}`}
                         aria-pressed={active}
                         disabled={Boolean(installing)}
                         title={"note" in option ? option.note : sessionLabel(option)}
@@ -420,7 +428,7 @@ export function NewSessionDialog({
                       >
                         <ProviderIcon agent={option.agent} provider={option.provider} className="size-5" />
                         <div
-                          className={`min-w-0 flex-1 text-left ${managed && update === false ? "[&_[data-slot=item-description]_svg]:text-green-600 dark:[&_[data-slot=item-description]_svg]:text-green-400" : managed && update === true ? "[&_[data-slot=item-description]_svg]:text-amber-600 dark:[&_[data-slot=item-description]_svg]:text-amber-400" : ""}`}
+                          className={`min-w-0 flex-1 text-left ${managed && update === false ? "[&_[data-slot=item-description]_svg]:text-green-600 dark:[&_[data-slot=item-description]_svg]:text-green-400" : updatable ? "[&_[data-slot=item-description]_svg]:text-amber-600 dark:[&_[data-slot=item-description]_svg]:text-amber-400" : ""}`}
                         >
                           <span className="block truncate">{sessionLabel(option)}</span>
                           {state && !state.available ? (
@@ -436,7 +444,7 @@ export function NewSessionDialog({
                           )}
                         </div>
                       </Button>
-                      {installable ? (
+                      {action ? (
                         <Button
                           type="button"
                           size="sm"
@@ -445,20 +453,8 @@ export function NewSessionDialog({
                           disabled={Boolean(installing)}
                           onClick={() => void install(option)}
                         >
-                          {installing === option.id ? <Spinner /> : null}
-                          {installing === option.id ? "Installing…" : "Install"}
-                        </Button>
-                      ) : managed && update !== false && update !== undefined ? (
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="ghost"
-                          className="absolute top-1/2 right-1.5 -translate-y-1/2"
-                          disabled={Boolean(installing)}
-                          onClick={() => void install(option)}
-                        >
-                          {installing === option.id ? <Spinner /> : null}
-                          {installing === option.id ? "Updating…" : "Update"}
+                          {busy ? <Spinner /> : null}
+                          {busy ? action.working : action.label}
                         </Button>
                       ) : null}
                     </div>

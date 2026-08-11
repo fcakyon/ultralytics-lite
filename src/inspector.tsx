@@ -54,7 +54,9 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { SEMANTIC_PROGRESS_CLASSES, type SemanticTone } from "@/lib/semantic-styles";
+import { without } from "@/lib/utils";
 import { MAX_OUTPUT_BYTES, readOutput } from "@/output-store";
+import { storedFontSize, zoomedFontSize } from "@/theme";
 import {
   type DirectoryCursor,
   type DirectoryListing,
@@ -448,11 +450,7 @@ function FileTree({
         setError(String(reason));
       } finally {
         loading.current.delete(path);
-        setLoadingPaths((current) => {
-          const next = new Set(current);
-          next.delete(path);
-          return next;
-        });
+        setLoadingPaths((current) => without(current, path));
       }
     },
     [rootId],
@@ -529,13 +527,24 @@ function FileTree({
   });
 
   // A folder is worth showing while searching if anything under it matches; only loaded listings can
-  // answer, which is what the walk above is for.
-  function subtreeMatches(path: string): boolean {
-    const listing = children[path];
-    return !!listing?.entries.some(
-      (entry) => entry.name.toLowerCase().includes(lowered) || (entry.isDirectory && subtreeMatches(entry.path)),
-    );
-  }
+  // answer, which is what the walk above is for. One pass marks every such folder, because the answer
+  // is asked for twice per row drawn — once to keep the folder and once to open it — and a folder deep
+  // in a tree would otherwise have its whole subtree rescanned once for every ancestor above it.
+  const matching = useMemo(() => {
+    const found = new Set<string>();
+    if (!lowered) return found;
+    const visit = (path: string): boolean => {
+      let inside = false;
+      for (const entry of children[path]?.entries ?? []) {
+        // Always descend: a folder is marked for its own sake, not only for its parent's answer.
+        if ((entry.isDirectory && visit(entry.path)) || entry.name.toLowerCase().includes(lowered)) inside = true;
+      }
+      if (inside) found.add(path);
+      return inside;
+    };
+    visit(root);
+    return found;
+  }, [children, lowered, root]);
 
   function rows(path: string, depth = 0): React.ReactNode {
     const listing = children[path];
@@ -545,13 +554,13 @@ function FileTree({
     }
     const entries = lowered
       ? listing.entries.filter(
-          (entry) => entry.name.toLowerCase().includes(lowered) || (entry.isDirectory && subtreeMatches(entry.path)),
+          (entry) => entry.name.toLowerCase().includes(lowered) || (entry.isDirectory && matching.has(entry.path)),
         )
       : listing.entries;
     return (
       <>
         {entries.map((entry) => {
-          const open = entry.isDirectory && (expanded.has(entry.path) || (!!lowered && subtreeMatches(entry.path)));
+          const open = entry.isDirectory && (expanded.has(entry.path) || matching.has(entry.path));
           return (
             <div key={entry.path}>
               <button
@@ -653,7 +662,7 @@ function FileTree({
       </div>
       {/* A walk that failed searched a partial tree, so its error shows over whatever it did find. */}
       {lowered && error ? <p className="p-3 text-xs text-destructive">{error}</p> : null}
-      {lowered && !error && !expandingAll && children[root] && !subtreeMatches(root) ? (
+      {lowered && !error && !expandingAll && children[root] && !matching.has(root) ? (
         <p className="px-3 py-2 text-xs text-muted-foreground">No matches</p>
       ) : null}
       {rootOpen ? rows(root, 1) : null}
@@ -661,17 +670,7 @@ function FileTree({
   );
 }
 
-// The same size and limits as the terminal's type, stored on its own key: prose and code read at
-// different sizes than a terminal for different people, so each surface remembers its own.
 const PREVIEW_FONT_KEY = "lite.preview.fontSize";
-const MIN_PREVIEW_FONT = 9;
-const MAX_PREVIEW_FONT = 24;
-const DEFAULT_PREVIEW_FONT = 13;
-
-function storedPreviewFontSize(): number {
-  const saved = Number(localStorage.getItem(PREVIEW_FONT_KEY));
-  return saved >= MIN_PREVIEW_FONT && saved <= MAX_PREVIEW_FONT ? saved : DEFAULT_PREVIEW_FONT;
-}
 
 // The preview inherits its type from here, so one zoom scales code, prose, and the line-number gutter
 // together while the header chrome keeps its own size. Zooming lives in this component so a step
@@ -687,7 +686,7 @@ function FileViewer({
   error: string;
   onBack: () => void;
 }) {
-  const [fontSize, setFontSize] = useState(storedPreviewFontSize);
+  const [fontSize, setFontSize] = useState(() => storedFontSize(PREVIEW_FONT_KEY));
   const viewer = useRef<HTMLElement>(null);
 
   // Reading is keyboard work, so the viewer takes focus as it opens and the zoom keys land here
@@ -719,9 +718,7 @@ function FileViewer({
   }, [onBack]);
 
   function zoom(step: -1 | 0 | 1) {
-    const size = step ? Math.min(MAX_PREVIEW_FONT, Math.max(MIN_PREVIEW_FONT, fontSize + step)) : DEFAULT_PREVIEW_FONT;
-    setFontSize(size);
-    localStorage.setItem(PREVIEW_FONT_KEY, String(size));
+    setFontSize(zoomedFontSize(PREVIEW_FONT_KEY, fontSize, step));
   }
 
   return (
@@ -1204,19 +1201,18 @@ export function Inspector({
                 </Tooltip>
               ))}
             </TabsList>
-            <span className="ml-auto flex items-center">
-              {tab === "usage" && session.agent === "shell" ? null : (
-                <ActionIconButton
-                  size="icon-sm"
-                  tooltip="Refresh"
-                  aria-label="Refresh"
-                  data-context-refresh
-                  onClick={() => refreshTab(tab as keyof typeof reload)}
-                >
-                  <RefreshCw />
-                </ActionIconButton>
-              )}
-            </span>
+            {tab === "usage" && session.agent === "shell" ? null : (
+              <ActionIconButton
+                size="icon-sm"
+                className="ml-auto"
+                tooltip="Refresh"
+                aria-label="Refresh"
+                data-context-refresh
+                onClick={() => refreshTab(tab as keyof typeof reload)}
+              >
+                <RefreshCw />
+              </ActionIconButton>
+            )}
           </div>
           {visited.has("files") ? (
             <TabsContent value="files" keepMounted className="min-h-0 overflow-hidden">

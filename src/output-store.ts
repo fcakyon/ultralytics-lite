@@ -21,14 +21,13 @@ const buffers = new Map<string, Buffer>();
 const listeners = new Map<string, Set<(data: Uint8Array) => void>>();
 
 // Titles and working directories arrive whether or not the session is visible, so their shared OSC
-// owner lives here where every session's output arrives rather than in the mounted terminal.
+// owner lives here where every session's output arrives rather than in the mounted terminal. Lite's
+// Claude status line reports work that produces no terminal output — a parent waiting for subagents,
+// a quiet shell command — through a private OSC of its own, which stays invisible and reaches the
+// same owner. One pass reads both: every byte a session prints comes through here, so a second
+// pattern would be a second reading of all of it.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: a control sequence is defined by them
-const METADATA = /\x1b\]([027]);([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
-// Lite's Claude status line reports work that produces no terminal output, such as a parent waiting
-// for subagents or a quiet shell command. The private OSC stays invisible while the shared output
-// owner makes the signal available even when the session's terminal is not mounted.
-// biome-ignore lint/suspicious/noControlCharactersInRegex: a control sequence is defined by them
-const ACTIVITY = /\x1b\]6973;lite-(working|idle)(?:\x07|\x1b\\)/g;
+const METADATA = /\x1b\](0|2|7|6973);([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
 // Common terminal notification protocols share the OSC owner with titles and working directories.
 // Lite needs only the signal for its in-app attention state; the terminal still owns rendering and
 // the notification payload is not retained separately from the bounded output buffer.
@@ -47,6 +46,18 @@ const OSC_OR_BELL = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|(\x07)/g;
 // than a title could be is no longer one, so the wait is given up rather than grown.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: a control sequence is defined by them
 const UNTERMINATED = /\x1b(?:\](?:(?!\x07|\x1b\\)[\s\S])*)?$/;
+// The folder a session says it is in, as a path. A shell that leaves a bare % in its own path, or
+// names a host no URL can hold, reports one that cannot be read back — and reading it is the last
+// thing this file does before it records where the chunk left off, so a throw here would cost the
+// session every title, folder and activity signal that followed as well. An unreadable path is
+// simply not one, and the folder Lite already knows about stands.
+function reportedPath(url: string): string {
+  try {
+    return decodeURIComponent(new URL(url).pathname).replace(/^\/([A-Za-z]:\/)/, "$1");
+  } catch {
+    return "";
+  }
+}
 const MAX_TAIL = 512;
 // Modern TUIs request a report whenever the terminal switches between dark and light. This state is
 // read here, where every session's output arrives, so background sessions and trimmed buffers keep it.
@@ -107,12 +118,12 @@ export function appendOutput(sessionId: string, data: number[]) {
   METADATA.lastIndex = 0;
   for (let match = METADATA.exec(text); match; match = METADATA.exec(text)) {
     if (match[1] === "7") {
-      if (match[2].startsWith("file://"))
-        path = decodeURIComponent(new URL(match[2]).pathname).replace(/^\/([A-Za-z]:\/)/, "$1");
+      if (match[2].startsWith("file://")) path = reportedPath(match[2]);
+    } else if (match[1] === "6973") {
+      const working = match[2] === "lite-working";
+      if (working || match[2] === "lite-idle") activity = working;
     } else title = match[2];
   }
-  ACTIVITY.lastIndex = 0;
-  for (let match = ACTIVITY.exec(text); match; match = ACTIVITY.exec(text)) activity = match[1] === "working";
   const tail = text.match(UNTERMINATED)?.[0] ?? "";
   if (activity === undefined && tail.startsWith("\x1b]6973;lite-")) activity = false;
   buffer.tail = tail.length > MAX_TAIL ? "" : tail;

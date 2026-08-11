@@ -91,6 +91,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Toaster, toast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { clearUsageCache, Inspector } from "@/inspector";
+import { swapped, without } from "@/lib/utils";
 import { NewSessionDialog } from "@/new-session-dialog";
 import {
   appendOutput,
@@ -114,7 +115,7 @@ const SHUT = 140;
 // A side reopens to the share of the window it started with, in the pixels a glide is measured in.
 function share(panel: PanelImperativeHandle | null, portion: string) {
   const size = panel?.getSize();
-  if (!size || !size.asPercentage) return 0;
+  if (!size?.asPercentage) return 0;
   return Math.round((size.inPixels / size.asPercentage) * Number.parseFloat(portion));
 }
 
@@ -1357,11 +1358,7 @@ function App() {
       sessionId,
       window.setTimeout(() => {
         timers.delete(sessionId);
-        setWorking((current) => {
-          const next = new Set(current);
-          next.delete(sessionId);
-          return next;
-        });
+        setWorking((current) => without(current, sessionId));
       }, QUIET_MS),
     );
   }, []);
@@ -1386,6 +1383,17 @@ function App() {
         return current;
       }
       return current.map((item) => (item.id === sessionId ? { ...item, name } : item));
+    });
+  }, []);
+
+  // A shell is only running an agent for as long as that agent is running: the badge goes back to the
+  // shell's own when the process ends, and when the session it ran in ends with it.
+  const forgetShellAgent = useCallback((sessionId: string) => {
+    setShellAgents((current) => {
+      if (!current.has(sessionId)) return current;
+      const next = new Map(current);
+      next.delete(sessionId);
+      return next;
     });
   }, []);
 
@@ -1419,12 +1427,7 @@ function App() {
       listen<{ sessionId: string; runId: string }>("pty-exit", ({ payload }) => {
         if (runs.current.get(payload.sessionId) !== payload.runId) return;
         runs.current.delete(payload.sessionId);
-        setShellAgents((current) => {
-          if (!current.has(payload.sessionId)) return current;
-          const next = new Map(current);
-          next.delete(payload.sessionId);
-          return next;
-        });
+        forgetShellAgent(payload.sessionId);
         setSessions((current) =>
           current.map((session) => (session.id === payload.sessionId ? { ...session, running: false } : session)),
         );
@@ -1459,7 +1462,7 @@ function App() {
       for (const timer of timers.values()) window.clearTimeout(timer);
       timers.clear();
     };
-  }, [markAttention, markDirectory, markWorking, markTitle]);
+  }, [forgetShellAgent, markAttention, markDirectory, markWorking, markTitle]);
 
   const launch = useCallback(async (session: Session, resume: boolean) => {
     if (runs.current.has(session.id)) return true;
@@ -1513,11 +1516,7 @@ function App() {
       setError(String(reason));
       return false;
     } finally {
-      setStartingIds((current) => {
-        const next = new Set(current);
-        next.delete(session.id);
-        return next;
-      });
+      setStartingIds((current) => without(current, session.id));
     }
   }, []);
 
@@ -1547,12 +1546,7 @@ function App() {
         await invoke("stop_session", { sessionId: session.id });
         stopped = true;
         runs.current.delete(session.id);
-        setShellAgents((current) => {
-          if (!current.has(session.id)) return current;
-          const next = new Map(current);
-          next.delete(session.id);
-          return next;
-        });
+        forgetShellAgent(session.id);
         const current = sessionsRef.current.find((item) => item.id === session.id) ?? live;
         // Keep the terminal mounted while its write queue holds later keystrokes behind recovery;
         // launch marks it disconnected if the replacement process cannot start.
@@ -1572,11 +1566,7 @@ function App() {
       } finally {
         recoveries.current.delete(session.id);
         pendingCleanups.current.delete(cleanup);
-        setStartingIds((current) => {
-          const next = new Set(current);
-          next.delete(session.id);
-          return next;
-        });
+        setStartingIds((current) => without(current, session.id));
       }
     })();
     cleanup = () => recovery.catch(() => {});
@@ -1718,12 +1708,7 @@ function App() {
       restarted,
       () => {
         const restored = { ...session, running: false };
-        setStartingIds((current) => {
-          const next = new Set(current);
-          next.delete(fresh.id);
-          next.add(session.id);
-          return next;
-        });
+        setStartingIds((current) => swapped(current, fresh.id, session.id));
         setSessions((current) => current.map((item) => (item.id === fresh.id ? restored : item)));
         setSelectedId((current) => (current === fresh.id ? session.id : current));
         resumed.current = session.id;
@@ -1733,12 +1718,7 @@ function App() {
           try {
             await invoke("stop_session", { sessionId: fresh.id });
           } catch (reason) {
-            setStartingIds((current) => {
-              const next = new Set(current);
-              next.delete(session.id);
-              next.add(fresh.id);
-              return next;
-            });
+            setStartingIds((current) => swapped(current, session.id, fresh.id));
             const relaunched = { ...fresh, running: false };
             setSessions((current) => current.map((item) => (item.id === session.id ? relaunched : item)));
             setSelectedId((current) => (current === session.id ? fresh.id : current));
@@ -1779,12 +1759,7 @@ function App() {
       await invoke("stop_session", { sessionId: session.id });
     } catch (reason) {
       const restored = { ...session, running: false };
-      setStartingIds((current) => {
-        const next = new Set(current);
-        next.delete(fresh.id);
-        next.add(session.id);
-        return next;
-      });
+      setStartingIds((current) => swapped(current, fresh.id, session.id));
       setSessions((current) => current.map((item) => (item.id === fresh.id ? restored : item)));
       setSelectedId((current) => (current === fresh.id ? session.id : current));
       resumed.current = session.id;
@@ -1808,7 +1783,7 @@ function App() {
     return true;
   }
 
-  async function restartAllSessions() {
+  function restartAllSessions() {
     for (const session of sessions) restartSession(session, session.id === selectedId);
   }
 
@@ -1998,11 +1973,7 @@ function App() {
     const timer = workTimers.current.get(session.id);
     if (timer) window.clearTimeout(timer);
     workTimers.current.delete(session.id);
-    setWorking((current) => {
-      const next = new Set(current);
-      next.delete(session.id);
-      return next;
-    });
+    setWorking((current) => without(current, session.id));
     setSessions((current) => current.filter((item) => item.id !== session.id));
     if (wasSelected) setSelectedId(nextSelectedId);
 
@@ -2151,7 +2122,7 @@ function App() {
         }}
         onRestartSession={(session) => void restartSession(session)}
         onCloseSession={closeSession}
-        onRestartAll={() => void restartAllSessions()}
+        onRestartAll={restartAllSessions}
         onCloseAll={() => setClosingAll(true)}
       >
         <div ref={layout} className="flex h-screen flex-col overflow-hidden bg-background text-foreground">

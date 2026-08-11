@@ -8,7 +8,7 @@ import { useEffect, useRef } from "react";
 import "@xterm/xterm/css/xterm.css";
 
 import { subscribeOutput, writeSession } from "@/output-store";
-import type { Theme } from "@/theme";
+import { storedFontSize, type Theme, zoomedFontSize } from "@/theme";
 import type { Agent } from "@/types";
 
 // Surface colors follow the app tokens; ANSI colors follow GitHub light and dark, matching the code preview.
@@ -72,13 +72,6 @@ const SEQUENCES = /\x1b(?:[\]P][\s\S]*?(?:\x07|\x1b\\)|\[[\x30-\x3f]*[ -/]*[@-~]
 const PARTIAL = /\x1b(?:[\]P](?:(?!\x07|\x1b\\)[\s\S])*|\[[\x30-\x3f]*[ -/]*|O)$/;
 
 const FONT_SIZE_KEY = "lite.terminal.fontSize";
-const MIN_FONT_SIZE = 9;
-const MAX_FONT_SIZE = 24;
-
-function storedFontSize(): number {
-  const saved = Number(localStorage.getItem(FONT_SIZE_KEY));
-  return saved >= MIN_FONT_SIZE && saved <= MAX_FONT_SIZE ? saved : 13;
-}
 
 export function TerminalView({
   sessionId,
@@ -124,10 +117,13 @@ export function TerminalView({
     const container = containerRef.current;
     if (!container) return;
 
+    // Held here as well as on the terminal, so a zoom step reads the size it last set rather than
+    // asking an option that is typed as though it might never have been given one.
+    let fontSize = storedFontSize(FONT_SIZE_KEY);
     const terminal = new Terminal({
       cursorBlink: true,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-      fontSize: storedFontSize(),
+      fontSize,
       lineHeight: 1.25,
       linkHandler: {
         activate: (event, url) => {
@@ -185,9 +181,8 @@ export function TerminalView({
     };
     resizeRef.current = resize;
     zoomRef.current = (step) => {
-      const size = step ? Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, terminal.options.fontSize ?? 13) + step) : 13;
-      terminal.options.fontSize = size;
-      localStorage.setItem(FONT_SIZE_KEY, String(size));
+      fontSize = zoomedFontSize(FONT_SIZE_KEY, fontSize, step);
+      terminal.options.fontSize = fontSize;
       requestAnimationFrame(resize);
     };
     // A width change arrives as a stream of frames: a drag, or the ease a collapsing panel runs
