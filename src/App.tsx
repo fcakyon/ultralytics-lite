@@ -778,6 +778,7 @@ function SessionRow({
   }
 
   function clearDrag(row: HTMLElement) {
+    delete document.documentElement.dataset.sessionDragging;
     for (const property of [
       "background-color",
       "box-shadow",
@@ -808,7 +809,7 @@ function SessionRow({
           event.pointerType === "touch" ||
           event.button !== 0 ||
           renaming ||
-          (event.target as Element).closest("input,[data-slot=item-actions]")
+          (event.target as Element).closest("button,input,[data-slot=item-actions]")
         )
           return;
         event.currentTarget.setPointerCapture(event.pointerId);
@@ -820,6 +821,7 @@ function SessionRow({
         if (!dragging.current) {
           if (Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y) < 6) return;
           dragging.current = true;
+          document.documentElement.dataset.sessionDragging = "";
           Object.assign(pointer.row.style, {
             backgroundColor: "var(--sidebar)",
             boxShadow: "0 6px 18px rgb(0 0 0 / 0.18)",
@@ -881,7 +883,7 @@ function SessionRow({
       }}
       // Never wrapped: Item wraps by default, and a row narrow enough to push the buttons onto a second
       // line takes the tooltip's anchor out from under the pointer that opened it.
-      className={`relative flex-nowrap transition-[color,background-color,opacity] data-[shifted]:transition-transform data-[shifted]:duration-150 data-[shifted]:ease-out motion-reduce:data-[shifted]:transition-none after:pointer-events-none after:absolute after:inset-x-1 after:z-10 after:hidden after:h-0.5 after:rounded-full after:bg-primary data-[drop=before]:after:-top-0.5 data-[drop=before]:after:block data-[drop=after]:after:-bottom-0.5 data-[drop=after]:after:block active:opacity-70 ${reorderable ? "cursor-grab select-none active:cursor-grabbing" : ""} ${active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/60"}`}
+      className={`relative cursor-pointer flex-nowrap transition-[color,background-color,opacity] data-[shifted]:transition-transform data-[shifted]:duration-150 data-[shifted]:ease-out motion-reduce:data-[shifted]:transition-none after:pointer-events-none after:absolute after:inset-x-1 after:z-10 after:hidden after:h-0.5 after:rounded-full after:bg-primary data-[drop=before]:after:-top-0.5 data-[drop=before]:after:block data-[drop=after]:after:-bottom-0.5 data-[drop=after]:after:block active:opacity-70 ${reorderable ? "select-none active:cursor-grabbing" : ""} ${active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/60"}`}
     >
       <ItemMedia>
         <SessionBadge
@@ -914,21 +916,23 @@ function SessionRow({
           {/* Only the visible title owns rename; its hit area stops where its text stops. */}
           <button
             type="button"
-            className="block w-fit max-w-full truncate text-xs font-medium"
+            className="group/title flex w-fit max-w-full cursor-pointer items-center gap-1 text-xs font-medium"
             aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
             onClick={(event) => {
               event.stopPropagation();
-              if (active && session.running) onRenamingChange(true);
-              else onSelect();
+              onRenamingChange(true);
             }}
-            onDoubleClick={() => onRenamingChange(true)}
             onKeyDown={(event) => {
               if (!reorderable || !event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
               event.preventDefault();
               onMove(event.key === "ArrowUp" ? -1 : 1);
             }}
           >
-            {session.name}
+            <span className="truncate">{session.name}</span>
+            <Pencil
+              aria-hidden="true"
+              className="size-3 shrink-0 opacity-0 transition-opacity group-hover/title:opacity-100 group-focus-visible/title:opacity-100"
+            />
           </button>
           <div
             className="mt-0.5 block w-fit max-w-full truncate font-mono text-[10px] text-muted-foreground"
