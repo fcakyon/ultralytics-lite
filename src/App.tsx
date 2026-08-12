@@ -14,6 +14,7 @@ import {
   ClipboardPaste,
   Copy,
   ExternalLink,
+  Folder,
   GitBranch,
   Link,
   Moon,
@@ -69,7 +70,7 @@ import {
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
-import { Item, ItemActions, ItemMedia } from "@/components/ui/item";
+import { Item, ItemActions, ItemContent, ItemDescription, ItemMedia, ItemTitle } from "@/components/ui/item";
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import {
   type PanelImperativeHandle,
@@ -94,7 +95,7 @@ import {
 } from "@/output-store";
 import { SettingsDialog } from "@/settings-dialog";
 import { applyTheme, initialTheme, type Theme } from "@/theme";
-import { type Agent, defaultSessionName, repoName, type Session, sessionLabel } from "@/types";
+import { type Agent, defaultSessionName, folderName, repoName, type Session, sessionLabel } from "@/types";
 import "./App.css";
 
 const STORAGE_KEY = "lite.sessions.v1";
@@ -548,6 +549,30 @@ const SESSION_STATUS = {
   },
 } as const;
 
+function sessionStatus(session: Session, attention: boolean, working: boolean) {
+  return SESSION_STATUS[!session.running ? "disconnected" : attention ? "attention" : working ? "working" : "idle"];
+}
+
+interface SessionGroup {
+  name: string;
+  path: string;
+  sessions: Session[];
+}
+
+// Worktrees sit beside their main checkout, so the repository recorded when the session was created
+// is the stable group. Plain folders group by their own path, and first appearance preserves the
+// session order the user chose.
+function groupSessions(sessions: Session[]): SessionGroup[] {
+  const groups = new Map<string, SessionGroup>();
+  for (const session of sessions) {
+    const path = session.repo ?? session.cwd;
+    const group = groups.get(path) ?? { name: folderName(path) || path, path, sessions: [] };
+    group.sessions.push(session);
+    groups.set(path, group);
+  }
+  return [...groups.values()];
+}
+
 // A local build names its commit and is red, so it is never mistaken for the installed copy.
 // A release names its version and says at a glance whether it is the current one. The top bar and the
 // update dialog render this one badge, so the version, the release date and the link to it are stated
@@ -662,8 +687,7 @@ function SessionBadge({
   starting: boolean;
   working: boolean;
 }) {
-  const status =
-    SESSION_STATUS[!session.running ? "disconnected" : attention ? "attention" : working ? "working" : "idle"];
+  const status = sessionStatus(session, attention, working);
   const ring = active ? "ring-sidebar-accent" : "ring-sidebar";
   return (
     <span className="relative flex size-7 shrink-0 items-center justify-center rounded-md border bg-background">
@@ -680,6 +704,145 @@ function SessionBadge({
         />
       )}
     </span>
+  );
+}
+
+function SessionSwitcher({
+  open,
+  sessions,
+  selectedId,
+  attention,
+  working,
+  startingIds,
+  shellAgents,
+  onOpenChange,
+  onSelect,
+}: {
+  open: boolean;
+  sessions: Session[];
+  selectedId: string;
+  attention: string[];
+  working: Set<string>;
+  startingIds: Set<string>;
+  shellAgents: Map<string, Agent>;
+  onOpenChange: (open: boolean) => void;
+  onSelect: (session: Session) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [activeId, setActiveId] = useState(selectedId);
+  const matches = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return sessions;
+    return sessions.filter((session) => {
+      const status = sessionStatus(session, attention.includes(session.id), working.has(session.id)).label;
+      return [session.name, session.cwd, session.repo, sessionLabel(session), status].some((value) =>
+        value?.toLowerCase().includes(needle),
+      );
+    });
+  }, [attention, query, sessions, working]);
+
+  useEffect(() => {
+    if (!open) return;
+    setQuery("");
+    setActiveId(selectedId);
+  }, [open, selectedId]);
+
+  useEffect(() => {
+    if (open && !matches.some((session) => session.id === activeId)) setActiveId(matches[0]?.id ?? "");
+  }, [activeId, matches, open]);
+
+  function move(direction: -1 | 1) {
+    if (!matches.length) return;
+    const index = matches.findIndex((session) => session.id === activeId);
+    const next =
+      index < 0 ? (direction > 0 ? 0 : matches.length - 1) : (index + direction + matches.length) % matches.length;
+    const id = matches[next].id;
+    setActiveId(id);
+    requestAnimationFrame(() => document.getElementById(`switch-session-${id}`)?.scrollIntoView({ block: "nearest" }));
+  }
+
+  function select(session: Session) {
+    onOpenChange(false);
+    onSelect(session);
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="gap-2 p-2 sm:max-w-xl" showCloseButton={false}>
+        <DialogHeader className="sr-only">
+          <DialogTitle>Switch session</DialogTitle>
+          <DialogDescription>Search open sessions by name, folder, agent, repository, or status.</DialogDescription>
+        </DialogHeader>
+        <InputGroup>
+          <InputGroupAddon>
+            <Search aria-hidden="true" />
+          </InputGroupAddon>
+          <InputGroupInput
+            autoFocus
+            value={query}
+            placeholder="Switch session…"
+            aria-label="Switch session"
+            aria-keyshortcuts={navigator.platform.includes("Mac") ? "Meta+P" : "Control+Shift+P"}
+            role="combobox"
+            aria-expanded="true"
+            aria-controls="session-switcher-list"
+            aria-autocomplete="list"
+            aria-activedescendant={activeId ? `switch-session-${activeId}` : undefined}
+            name="session-switcher"
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                move(event.key === "ArrowDown" ? 1 : -1);
+              } else if (event.key === "Enter") {
+                const session = matches.find((item) => item.id === activeId) ?? matches[0];
+                if (session) select(session);
+              }
+            }}
+          />
+        </InputGroup>
+        <DialogBody className="max-h-[min(28rem,60dvh)] overscroll-contain">
+          <div id="session-switcher-list" role="listbox" className="space-y-0.5">
+            {matches.map((session) => {
+              const needsAttention = attention.includes(session.id);
+              return (
+                <Item
+                  key={session.id}
+                  id={`switch-session-${session.id}`}
+                  size="xs"
+                  className={`flex-nowrap text-left ${session.id === activeId ? "bg-accent text-accent-foreground" : "hover:bg-accent/60"}`}
+                  render={<button type="button" role="option" aria-selected={session.id === activeId} />}
+                  onPointerMove={() => setActiveId(session.id)}
+                  onClick={() => select(session)}
+                >
+                  <ItemMedia>
+                    <SessionBadge
+                      session={session}
+                      agent={shellAgents.get(session.id)}
+                      active={session.id === selectedId}
+                      attention={needsAttention}
+                      starting={startingIds.has(session.id)}
+                      working={working.has(session.id)}
+                    />
+                  </ItemMedia>
+                  <ItemContent>
+                    <ItemTitle className="w-full text-xs">{session.name}</ItemTitle>
+                    <ItemDescription className="truncate font-mono text-[10px]">
+                      {shortPath(session.cwd)} · {sessionLabel(session)}
+                    </ItemDescription>
+                  </ItemContent>
+                </Item>
+              );
+            })}
+            {!matches.length ? (
+              <p className="px-2 py-4 text-center text-xs text-muted-foreground">No sessions found</p>
+            ) : null}
+          </div>
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -839,27 +1002,36 @@ function SessionRow({
           });
         }
         event.preventDefault();
-        const parent = pointer.row.parentElement;
-        const rows = [...(parent?.querySelectorAll<HTMLElement>("[data-context-session]") ?? [])];
-        const parentTop = parent?.getBoundingClientRect().top ?? 0;
+        const list = pointer.row.closest("[data-session-list]");
+        const rows = [...(list?.querySelectorAll<HTMLElement>("[data-context-session]") ?? [])];
         const before = rows.find(
-          (row) => row !== pointer.row && event.clientY < parentTop + row.offsetTop + row.offsetHeight / 2,
+          (row) => row !== pointer.row && event.clientY < row.getBoundingClientRect().top + row.offsetHeight / 2,
         );
         const last = rows[rows.length - 1];
-        const row = before ?? (last === pointer.row ? rows[rows.length - 2] : last);
-        const after = !before;
+        let row = before ?? (last === pointer.row ? rows[rows.length - 2] : last);
+        let after = !before;
         pointer.row.style.transform = `translate3d(0, ${event.clientY - pointer.y}px, 0)`;
         if (!row) return clearDrop();
+        if (row.parentElement !== pointer.row.parentElement) {
+          const targetRows = [...(row.parentElement?.querySelectorAll<HTMLElement>("[data-context-session]") ?? [])];
+          const targetRect = row.parentElement?.getBoundingClientRect();
+          after = Boolean(targetRect && event.clientY >= targetRect.top + targetRect.height / 2);
+          row = targetRows[after ? targetRows.length - 1 : 0];
+        }
         if (drop.current?.row === row && drop.current?.after === after) return;
         const sourceIndex = rows.indexOf(pointer.row);
         const targetIndex = rows.indexOf(row);
         const start = sourceIndex < targetIndex ? sourceIndex + 1 : targetIndex + Number(after);
         const end = sourceIndex < targetIndex ? targetIndex + Number(after) : sourceIndex;
         const shifts: [HTMLElement, number][] = [];
-        for (let index = start; index < end; index++) {
-          const shiftedRow = rows[index];
-          const neighbor = rows[index + (sourceIndex < targetIndex ? -1 : 1)];
-          shifts.push([shiftedRow, neighbor.offsetTop - shiftedRow.offsetTop]);
+        // Group headers do not move during a drag, so cross-group drops use the insertion marker
+        // without pretending the rows can close a gap that includes a header.
+        if (pointer.row.parentElement === row.parentElement) {
+          for (let index = start; index < end; index++) {
+            const shiftedRow = rows[index];
+            const neighbor = rows[index + (sourceIndex < targetIndex ? -1 : 1)];
+            shifts.push([shiftedRow, neighbor.offsetTop - shiftedRow.offsetTop]);
+          }
         }
         clearDrop();
         row.dataset.drop = after ? "after" : "before";
@@ -1088,6 +1260,8 @@ function App() {
   const [working, setWorking] = useState<Set<string>>(new Set());
   const [shellAgents, setShellAgents] = useState<Map<string, Agent>>(new Map());
   const [query, setQuery] = useState("");
+  const [sessionSwitcherOpen, setSessionSwitcherOpen] = useState(false);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const [renamingId, setRenamingId] = useState("");
   // Each side collapses to a rail of icons rather than to nothing, so the panel is still there to click
   // or drag back open. Dragging past the minimum is what collapses it; the handle never goes away.
@@ -1122,6 +1296,7 @@ function App() {
   const forceWorktree = useRef(new Map<string, boolean>());
   // Sessions whose worktree the user chose to keep; cleanup forgets Lite's record instead of removing.
   const keptWorktrees = useRef(new Set<string>());
+  const recentSessions = useRef(sessions.map((session) => session.id));
   // Sessions with a close flow in flight: the dialog is singular, so from probe to answer only
   // one worktree session may be closing at all.
   const closingIds = useRef(new Set<string>());
@@ -1158,6 +1333,7 @@ function App() {
   }, []);
   const selected = useMemo(() => sessions.find((session) => session.id === selectedId), [sessions, selectedId]);
   const selectedStarting = selected ? startingIds.has(selected.id) : false;
+  const sessionShortcut = navigator.platform.includes("Mac") ? "⌘P" : "Ctrl+Shift+P";
   // A session is found by what names it: the subject it was given and the folder it works in.
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -1166,13 +1342,36 @@ function App() {
       (session) => session.name.toLowerCase().includes(needle) || session.cwd.toLowerCase().includes(needle),
     );
   }, [sessions, query]);
-  visibleRef.current = visible;
+  const visibleGroups = useMemo(() => groupSessions(visible), [visible]);
+  const displayed = visibleGroups.flatMap((group) =>
+    query.trim() || !collapsedGroups.has(group.path) ? group.sessions : [],
+  );
+  const sessionsById = new Map(sessions.map((session) => [session.id, session]));
+  recentSessions.current = recentSessions.current.filter((id) => sessionsById.has(id));
+  const recentIds = new Set(recentSessions.current);
+  const switcherSessions = recentSessions.current.flatMap((id) => sessionsById.get(id) ?? []);
+  for (const session of sessions) {
+    if (!recentIds.has(session.id)) switcherSessions.push(session);
+  }
+  visibleRef.current = shut.sidebar ? sessions : displayed;
   sessionsRef.current = sessions;
   themeRef.current = theme;
   selectedRef.current = selected;
   notificationsRef.current = notifications;
   closeRef.current = closeSession;
+  function expandSessionGroup(session: Session) {
+    const group = session.repo ?? session.cwd;
+    if (!collapsedGroups.has(group)) return;
+    setCollapsedGroups((current) => {
+      if (!current.has(group)) return current;
+      const next = new Set(current);
+      next.delete(group);
+      return next;
+    });
+  }
   openRef.current = (session) => {
+    recentSessions.current = [session.id, ...recentSessions.current.filter((id) => id !== session.id)];
+    expandSessionGroup(session);
     clearAttention(session.id);
     setSelectedId(session.id);
     if (session.running) {
@@ -1277,7 +1476,9 @@ function App() {
     function onKeyDown(event: KeyboardEvent) {
       if (event.defaultPrevented || (!event.metaKey && !event.ctrlKey)) return;
       if (event.target instanceof Element && event.target.closest('[role="dialog"]')) return;
-      if (event.key === "n") setNewSessionOpen(true);
+      const switchSession = event.key.toLowerCase() === "p" && (event.metaKey || (event.ctrlKey && event.shiftKey));
+      if (switchSession) setSessionSwitcherOpen(true);
+      else if (event.key === "n") setNewSessionOpen(true);
       else if (event.key === ",") setSettingsOpen(true);
       else if (event.key === "w" && selectedRef.current) closeRef.current(selectedRef.current);
       else if (event.shiftKey && event.key.toLowerCase() === "u") {
@@ -1650,6 +1851,8 @@ function App() {
 
   function createSession(session: Session) {
     resumed.current = session.id;
+    recentSessions.current = [session.id, ...recentSessions.current];
+    expandSessionGroup(session);
     setSessions((current) => [session, ...current]);
     setSelectedId(session.id);
     void launch(session, false);
@@ -1657,13 +1860,28 @@ function App() {
 
   function reorderSession(draggedId: string, targetId: string, after: boolean) {
     setSessions((current) => {
-      const draggedIndex = current.findIndex((session) => session.id === draggedId);
-      const targetIndex = current.findIndex((session) => session.id === targetId);
+      const ordered = groupSessions(current).flatMap((group) => group.sessions);
+      const draggedIndex = ordered.findIndex((session) => session.id === draggedId);
+      const targetIndex = ordered.findIndex((session) => session.id === targetId);
       if (draggedIndex < 0 || targetIndex < 0 || draggedIndex === targetIndex) return current;
-      const next = [...current];
-      const [dragged] = next.splice(draggedIndex, 1);
+      const dragged = ordered[draggedIndex];
+      const target = ordered[targetIndex];
+      const draggedGroup = dragged.repo ?? dragged.cwd;
+      const targetGroup = target.repo ?? target.cwd;
+      if (draggedGroup !== targetGroup) {
+        const moved = ordered.filter((session) => (session.repo ?? session.cwd) === draggedGroup);
+        const next = ordered.filter((session) => (session.repo ?? session.cwd) !== draggedGroup);
+        const targets = next.flatMap((session, index) =>
+          (session.repo ?? session.cwd) === targetGroup ? [index] : [],
+        );
+        const destination = after ? targets[targets.length - 1] + 1 : targets[0];
+        next.splice(destination, 0, ...moved);
+        return next;
+      }
+      const next = [...ordered];
+      const [moved] = next.splice(draggedIndex, 1);
       const destination = next.findIndex((session) => session.id === targetId) + Number(after);
-      next.splice(destination, 0, dragged);
+      next.splice(destination, 0, moved);
       return next;
     });
   }
@@ -1711,6 +1929,10 @@ function App() {
 
   // Restarting keeps the tab and its folder but asks the provider for a conversation of its own, so the
   // session it resumed by id is retained only until the shared Undo window expires.
+  function replaceRecentSession(from: string, to: string) {
+    recentSessions.current = recentSessions.current.map((id) => (id === from ? to : id));
+  }
+
   function restartSession(session: Session, select = true, recovered = false) {
     // A close in flight owns this session's fate: restarting now would inherit a worktree the
     // close dialog is about to take away.
@@ -1734,6 +1956,7 @@ function App() {
       restarted,
       () => {
         const restored = { ...session, running: false };
+        replaceRecentSession(fresh.id, session.id);
         setStartingIds((current) => swapped(current, fresh.id, session.id));
         setSessions((current) => current.map((item) => (item.id === fresh.id ? restored : item)));
         setSelectedId((current) => (current === fresh.id ? session.id : current));
@@ -1744,6 +1967,7 @@ function App() {
           try {
             await invoke("stop_session", { sessionId: fresh.id });
           } catch (reason) {
+            replaceRecentSession(session.id, fresh.id);
             setStartingIds((current) => swapped(current, session.id, fresh.id));
             const relaunched = { ...fresh, running: false };
             setSessions((current) => current.map((item) => (item.id === session.id ? relaunched : item)));
@@ -1775,6 +1999,7 @@ function App() {
 
   async function restartSessionNow(session: Session, fresh: Session, select: boolean): Promise<boolean> {
     runs.current.delete(session.id);
+    replaceRecentSession(session.id, fresh.id);
     setStartingIds((current) => new Set(current).add(fresh.id));
     setSessions((current) => current.map((item) => (item.id === session.id ? fresh : item)));
     if (select) {
@@ -1784,6 +2009,7 @@ function App() {
     try {
       await invoke("stop_session", { sessionId: session.id });
     } catch (reason) {
+      replaceRecentSession(fresh.id, session.id);
       const restored = { ...session, running: false };
       setStartingIds((current) => swapped(current, fresh.id, session.id));
       setSessions((current) => current.map((item) => (item.id === fresh.id ? restored : item)));
@@ -1795,6 +2021,7 @@ function App() {
       return false;
     }
     if (!(await launch(fresh, false))) {
+      replaceRecentSession(fresh.id, session.id);
       await invoke("delete_session_data", { sessionId: fresh.id }).catch(() => {});
       clearOutput(fresh.id);
       clearInspectorCache(fresh.id);
@@ -1992,6 +2219,7 @@ function App() {
     if (startingIds.has(session.id)) return;
     clearAttention(session.id);
     const index = sessions.findIndex((item) => item.id === session.id);
+    const recentIndex = recentSessions.current.indexOf(session.id);
     const wasSelected = selectedId === session.id;
     const nextSelectedId = sessions.find((item) => item.id !== session.id)?.id ?? "";
     runs.current.delete(session.id);
@@ -2006,6 +2234,10 @@ function App() {
     function restore(running: boolean) {
       keptWorktrees.current.delete(session.id);
       forceWorktree.current.delete(session.id);
+      expandSessionGroup(session);
+      if (!recentSessions.current.includes(session.id)) {
+        recentSessions.current.splice(Math.min(Math.max(recentIndex, 0), recentSessions.current.length), 0, session.id);
+      }
       setSessions((current) => {
         if (current.some((item) => item.id === session.id)) {
           return current.map((item) => (item.id === session.id ? { ...item, running } : item));
@@ -2193,7 +2425,22 @@ function App() {
                     provider={selected.provider}
                     className="size-4 shrink-0"
                   />
-                  <span className="min-w-0 truncate text-xs font-medium">{selected.name}</span>
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <button
+                          type="button"
+                          className="min-w-0 truncate rounded-sm text-xs font-medium hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                          aria-label="Switch session"
+                          aria-keyshortcuts={navigator.platform.includes("Mac") ? "Meta+P" : "Control+Shift+P"}
+                          onClick={() => setSessionSwitcherOpen(true)}
+                        />
+                      }
+                    >
+                      {selected.name}
+                    </TooltipTrigger>
+                    <TooltipContent>Switch session · {sessionShortcut}</TooltipContent>
+                  </Tooltip>
                   <button
                     type="button"
                     className="min-w-0 max-w-full overflow-hidden text-left font-mono text-[11px] text-muted-foreground hover:text-foreground"
@@ -2372,40 +2619,74 @@ function App() {
                       </ActionIconButton>
                     </div>
                     <ScrollArea className="min-h-0 flex-1">
-                      <div className="space-y-0.5 px-2 pb-2">
+                      <div className="space-y-0.5 px-2 pb-2" data-session-list>
                         {query && !visible.length ? (
                           <p className="px-2 py-1.5 text-xs text-muted-foreground">No session matches “{query}”.</p>
                         ) : null}
-                        {visible.map((session) => (
-                          <SessionRow
-                            key={session.id}
-                            session={session}
-                            agent={shellAgents.get(session.id)}
-                            active={session.id === selectedId}
-                            attention={attention.includes(session.id)}
-                            starting={startingIds.has(session.id)}
-                            working={working.has(session.id)}
-                            renaming={renamingId === session.id}
-                            reorderable={!query.trim()}
-                            onSelect={() => openRef.current(session)}
-                            onRename={(name) =>
-                              setSessions((current) =>
-                                current.map((item) =>
-                                  item.id === session.id ? { ...item, name, renamed: true } : item,
-                                ),
-                              )
-                            }
-                            onRenamingChange={(renaming) => setRenamingId(renaming ? session.id : "")}
-                            onReorder={(targetId, after) => reorderSession(session.id, targetId, after)}
-                            onMove={(direction) => {
-                              const index = sessionsRef.current.findIndex((item) => item.id === session.id);
-                              const target = sessionsRef.current[index + direction];
-                              if (target) reorderSession(session.id, target.id, direction > 0);
-                            }}
-                            onRestart={() => void restartSession(session)}
-                            onClose={() => closeSession(session)}
-                          />
-                        ))}
+                        {visibleGroups.map((group) => {
+                          const open = Boolean(query.trim()) || !collapsedGroups.has(group.path);
+                          return (
+                            <section key={group.path}>
+                              <button
+                                type="button"
+                                className="flex h-7 w-full items-center gap-1.5 rounded-md px-1.5 text-left text-[10px] font-medium text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring focus-visible:outline-none"
+                                title={group.path}
+                                aria-label={`${group.name}, ${group.sessions.length} session${group.sessions.length === 1 ? "" : "s"}`}
+                                aria-expanded={open}
+                                onClick={() =>
+                                  setCollapsedGroups((current) => {
+                                    const next = new Set(current);
+                                    if (next.has(group.path)) next.delete(group.path);
+                                    else next.add(group.path);
+                                    return next;
+                                  })
+                                }
+                              >
+                                <ChevronRight
+                                  aria-hidden="true"
+                                  className={`size-3 transition-transform motion-reduce:transition-none ${open ? "rotate-90" : ""}`}
+                                />
+                                <Folder aria-hidden="true" className="size-3" />
+                                <span className="min-w-0 flex-1 truncate">{group.name}</span>
+                                <span className="tabular-nums">{group.sessions.length}</span>
+                              </button>
+                              {open ? (
+                                <div className="space-y-0.5">
+                                  {group.sessions.map((session) => (
+                                    <SessionRow
+                                      key={session.id}
+                                      session={session}
+                                      agent={shellAgents.get(session.id)}
+                                      active={session.id === selectedId}
+                                      attention={attention.includes(session.id)}
+                                      starting={startingIds.has(session.id)}
+                                      working={working.has(session.id)}
+                                      renaming={renamingId === session.id}
+                                      reorderable={!query.trim()}
+                                      onSelect={() => openRef.current(session)}
+                                      onRename={(name) =>
+                                        setSessions((current) =>
+                                          current.map((item) =>
+                                            item.id === session.id ? { ...item, name, renamed: true } : item,
+                                          ),
+                                        )
+                                      }
+                                      onRenamingChange={(renaming) => setRenamingId(renaming ? session.id : "")}
+                                      onReorder={(targetId, after) => reorderSession(session.id, targetId, after)}
+                                      onMove={(direction) => {
+                                        const index = displayed.findIndex((item) => item.id === session.id);
+                                        const target = displayed[index + direction];
+                                        if (target) reorderSession(session.id, target.id, direction > 0);
+                                      }}
+                                      onRestart={() => void restartSession(session)}
+                                      onClose={() => closeSession(session)}
+                                    />
+                                  ))}
+                                </div>
+                              ) : null}
+                            </section>
+                          );
+                        })}
                       </div>
                     </ScrollArea>
                   </>
@@ -2847,6 +3128,17 @@ function App() {
             onOpenChange={setNewSessionOpen}
             onCreate={createSession}
             sessions={sessions}
+          />
+          <SessionSwitcher
+            open={sessionSwitcherOpen}
+            sessions={switcherSessions}
+            selectedId={selectedId}
+            attention={attention}
+            working={working}
+            startingIds={startingIds}
+            shellAgents={shellAgents}
+            onOpenChange={setSessionSwitcherOpen}
+            onSelect={(session) => openRef.current(session)}
           />
           <SettingsDialog
             open={settingsOpen}
