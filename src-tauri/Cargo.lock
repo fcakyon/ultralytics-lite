@@ -1941,12 +1941,15 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lite"
-version = "0.0.24"
+version = "0.0.25"
 dependencies = [
  "atomicwrites",
  "block2",
+ "dbus",
  "objc2",
+ "objc2-core-foundation",
  "objc2-foundation",
+ "objc2-io-kit",
  "objc2-user-notifications",
  "portable-pty",
  "serde",
@@ -1959,6 +1962,7 @@ dependencies = [
  "toml_edit 0.25.13+spec-1.1.0",
  "tungstenite",
  "uuid",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2201,7 +2205,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.13.1",
+ "block2",
  "dispatch2",
+ "libc",
  "objc2",
 ]
 
@@ -2284,7 +2290,11 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
 dependencies = [
+ "bitflags 2.13.1",
+ "block2",
+ "dispatch2",
  "libc",
+ "objc2",
  "objc2-core-foundation",
 ]
 

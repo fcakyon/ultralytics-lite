@@ -152,6 +152,194 @@ fn stop_pty(session: &mut PtySession) -> Result<(), String> {
 #[derive(Default)]
 struct Sessions(Mutex<HashMap<String, PtySession>>);
 
+#[cfg(target_os = "macos")]
+struct PlatformWakeLock(u32);
+
+#[cfg(target_os = "macos")]
+impl PlatformWakeLock {
+    fn new() -> Result<Self, String> {
+        use objc2_core_foundation::CFString;
+        use objc2_io_kit::{IOPMAssertionCreateWithName, kIOPMAssertionLevelOn, kIOReturnSuccess};
+
+        let mut id = 0;
+        let result = unsafe {
+            IOPMAssertionCreateWithName(
+                Some(&CFString::from_static_str("PreventUserIdleDisplaySleep")),
+                kIOPMAssertionLevelOn,
+                Some(&CFString::from_static_str("Lite has active sessions")),
+                &mut id,
+            )
+        };
+        (result == kIOReturnSuccess)
+            .then_some(Self(id))
+            .ok_or_else(|| format!("Could not keep the system awake: IOKit error {result}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for PlatformWakeLock {
+    fn drop(&mut self) {
+        objc2_io_kit::IOPMAssertionRelease(self.0);
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct PlatformWakeLock(isize);
+
+#[cfg(target_os = "windows")]
+impl PlatformWakeLock {
+    fn new() -> Result<Self, String> {
+        use windows::Win32::System::Power::{
+            PowerCreateRequest, PowerRequestDisplayRequired, PowerRequestSystemRequired,
+            PowerSetRequest,
+        };
+        use windows::Win32::System::Threading::{
+            POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0,
+        };
+        use windows::core::PWSTR;
+
+        let mut reason: Vec<u16> = "Lite has active sessions"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let context = REASON_CONTEXT {
+            Version: 0,
+            Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+            Reason: REASON_CONTEXT_0 {
+                SimpleReasonString: PWSTR(reason.as_mut_ptr()),
+            },
+        };
+        let handle = unsafe { PowerCreateRequest(&context) }.map_err(|error| error.to_string())?;
+        let wake_lock = Self(handle.0 as isize);
+        unsafe {
+            PowerSetRequest(handle, PowerRequestSystemRequired)
+                .and_then(|_| PowerSetRequest(handle, PowerRequestDisplayRequired))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(wake_lock)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for PlatformWakeLock {
+    fn drop(&mut self) {
+        let handle = windows::Win32::Foundation::HANDLE(self.0 as *mut _);
+        unsafe {
+            let _ = windows::Win32::System::Power::PowerClearRequest(
+                handle,
+                windows::Win32::System::Power::PowerRequestSystemRequired,
+            );
+            let _ = windows::Win32::System::Power::PowerClearRequest(
+                handle,
+                windows::Win32::System::Power::PowerRequestDisplayRequired,
+            );
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PlatformWakeLock {
+    session: dbus::blocking::Connection,
+    cookie: u32,
+    _system: dbus::blocking::Connection,
+    _idle: dbus::arg::OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl PlatformWakeLock {
+    fn new() -> Result<Self, String> {
+        let system = dbus::blocking::Connection::new_system().map_err(|error| error.to_string())?;
+        let (idle,) = system
+            .with_proxy(
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                Duration::from_secs(5),
+            )
+            .method_call(
+                "org.freedesktop.login1.Manager",
+                "Inhibit",
+                ("idle", "Lite", "Lite has active sessions", "block"),
+            )
+            .map_err(|error| format!("Could not keep the system awake: {error}"))?;
+        let session =
+            dbus::blocking::Connection::new_session().map_err(|error| error.to_string())?;
+        let (cookie,) = session
+            .with_proxy(
+                "org.freedesktop.ScreenSaver",
+                "/org/freedesktop/ScreenSaver",
+                Duration::from_secs(5),
+            )
+            .method_call(
+                "org.freedesktop.ScreenSaver",
+                "Inhibit",
+                ("com.ultralytics.lite", "Lite has active sessions"),
+            )
+            .map_err(|error| format!("Could not keep the display awake: {error}"))?;
+        Ok(Self {
+            session,
+            cookie,
+            _system: system,
+            _idle: idle,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PlatformWakeLock {
+    fn drop(&mut self) {
+        let _: Result<(), _> = self
+            .session
+            .with_proxy(
+                "org.freedesktop.ScreenSaver",
+                "/org/freedesktop/ScreenSaver",
+                Duration::from_secs(5),
+            )
+            .method_call("org.freedesktop.ScreenSaver", "UnInhibit", (self.cookie,));
+    }
+}
+
+#[derive(Default)]
+struct WakeLock(Mutex<Option<PlatformWakeLock>>, AtomicU64);
+
+fn update_keep_awake(wake_lock: &WakeLock, enabled: bool, generation: u64) -> Result<(), String> {
+    let mut platform_lock = wake_lock.0.lock().map_err(|error| error.to_string())?;
+    if generation != wake_lock.1.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if enabled && platform_lock.is_none() {
+        match PlatformWakeLock::new() {
+            Ok(next) if generation == wake_lock.1.load(Ordering::SeqCst) => {
+                *platform_lock = Some(next);
+            }
+            Ok(_) => {}
+            Err(error) if generation == wake_lock.1.load(Ordering::SeqCst) => return Err(error),
+            Err(_) => {}
+        }
+    } else if !enabled {
+        *platform_lock = None;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+async fn set_keep_awake(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let generation = app.state::<WakeLock>().1.fetch_add(1, Ordering::SeqCst) + 1;
+    tauri::async_runtime::spawn_blocking(move || {
+        update_keep_awake(&app.state::<WakeLock>(), enabled, generation)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+fn set_keep_awake(wake_lock: State<WakeLock>, enabled: bool) -> Result<(), String> {
+    let generation = wake_lock.1.fetch_add(1, Ordering::SeqCst) + 1;
+    update_keep_awake(&wake_lock, enabled, generation)
+}
+
 #[derive(Default)]
 struct Roots(Mutex<HashMap<String, PathBuf>>);
 
@@ -4858,6 +5046,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Sessions::default())
+        .manage(WakeLock::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(load_roots(app.handle()));
@@ -4879,6 +5068,7 @@ pub fn run() {
             watch_shell_agent,
             resize_session,
             stop_session,
+            set_keep_awake,
             delete_session_data,
             list_directory,
             read_text_file,

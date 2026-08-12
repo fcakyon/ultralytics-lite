@@ -44,6 +44,8 @@ export function SettingsDialog({
   onSignIn,
   notifications,
   onNotificationsChange,
+  keepAwake,
+  onKeepAwakeChange,
   theme,
   onThemeChange,
   version,
@@ -57,6 +59,8 @@ export function SettingsDialog({
   onSignIn: (agent: Agent) => void;
   notifications: boolean;
   onNotificationsChange: (enabled: boolean) => Promise<void>;
+  keepAwake: boolean;
+  onKeepAwakeChange: (enabled: boolean) => void;
   theme: Theme;
   onThemeChange: (theme: Theme) => void;
   version: string;
@@ -181,6 +185,20 @@ export function SettingsDialog({
                       checked={theme === "dark"}
                       onCheckedChange={(checked) => onThemeChange(checked ? "dark" : "light")}
                     />
+                  </ItemActions>
+                </Item>
+                <Item variant="outline">
+                  <ItemMedia variant="icon">
+                    <Sun />
+                  </ItemMedia>
+                  <ItemContent>
+                    <ItemTitle>Keep System Awake</ItemTitle>
+                    <ItemDescription>
+                      Prevent automatic sleep and display shutoff while a session is active.
+                    </ItemDescription>
+                  </ItemContent>
+                  <ItemActions>
+                    <Switch aria-label="Keep system awake" checked={keepAwake} onCheckedChange={onKeepAwakeChange} />
                   </ItemActions>
                 </Item>
                 {notificationsSupported ? (

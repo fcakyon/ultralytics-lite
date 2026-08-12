@@ -178,7 +178,7 @@ function SessionViewOptions({
         <TooltipTrigger render={<span className="inline-flex">{trigger}</span>} />
         <TooltipContent>Session view: {label}</TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" className="w-48">
+      <DropdownMenuContent align="start" className="w-48">
         <DropdownMenuGroup>
           <DropdownMenuLabel>Sort by</DropdownMenuLabel>
           {SESSION_SORTS.map((option) => {
@@ -293,6 +293,7 @@ const RELEASE_NOTE = {
 } as const;
 
 const NOTIFICATIONS_KEY = "lite.notifications";
+const KEEP_AWAKE_KEY = "lite.keep-awake";
 
 type UpdateStatus = "checking" | "available" | "rebuild" | "current" | "installing" | "error";
 
@@ -1413,6 +1414,7 @@ function App() {
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notifications, setNotifications] = useState(() => localStorage.getItem(NOTIFICATIONS_KEY) === "true");
+  const [keepAwake, setKeepAwake] = useState(() => localStorage.getItem(KEEP_AWAKE_KEY) === "true");
   const [closingAll, setClosingAll] = useState(false);
   // Bulk close is running: the dialog stays up and sessions stay untouched until every stop and
   // cleanup has settled, so nothing can be reopened under its own cleanup.
@@ -1695,6 +1697,20 @@ function App() {
     );
   }, [sessions]);
 
+  const hasActiveSessions = sessions.some((session) => session.running);
+  useEffect(() => {
+    let current = true;
+    void invoke("set_keep_awake", { enabled: keepAwake && hasActiveSessions }).catch((reason) => {
+      if (!current) return;
+      localStorage.setItem(KEEP_AWAKE_KEY, "false");
+      setKeepAwake(false);
+      setError(String(reason));
+    });
+    return () => {
+      current = false;
+    };
+  }, [hasActiveSessions, keepAwake]);
+
   useEffect(() => {
     void getVersion()
       .then(setVersion)
@@ -1876,6 +1892,11 @@ function App() {
     localStorage.setItem(NOTIFICATIONS_KEY, String(enabled));
     notificationsRef.current = enabled;
     setNotifications(enabled);
+  }, []);
+
+  const changeKeepAwake = useCallback((enabled: boolean) => {
+    localStorage.setItem(KEEP_AWAKE_KEY, String(enabled));
+    setKeepAwake(enabled);
   }, []);
 
   const launch = useCallback(async (session: Session, resume: boolean) => {
@@ -2965,7 +2986,7 @@ function App() {
                     {selected.running ? (
                       <fieldset
                         aria-label="Session actions"
-                        className="absolute top-2 right-2 z-10 hidden items-center gap-0.5 bg-background"
+                        className="absolute top-2 right-2 z-20 hidden items-center gap-0.5 rounded-lg bg-background/90 p-0.5 shadow-sm"
                         data-terminal-action
                         onMouseDown={(event) => event.preventDefault()}
                       >
@@ -3373,6 +3394,8 @@ function App() {
             onSignIn={signIn}
             notifications={notifications}
             onNotificationsChange={changeNotifications}
+            keepAwake={keepAwake}
+            onKeepAwakeChange={changeKeepAwake}
             theme={theme}
             onThemeChange={setTheme}
             version={version}
