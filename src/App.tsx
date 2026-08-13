@@ -108,7 +108,15 @@ import {
   writeSession,
 } from "@/output-store";
 import { SettingsDialog } from "@/settings-dialog";
-import { applyTheme, initialTheme, storedFontSize, type Theme, zoomedFontSize, zoomStep } from "@/theme";
+import {
+  applyTheme,
+  contentZoomStyle,
+  initialTheme,
+  storedFontSize,
+  type Theme,
+  zoomedFontSize,
+  zoomStep,
+} from "@/theme";
 import { type Agent, defaultSessionName, folderName, repoName, type Session, sessionLabel } from "@/types";
 import "./App.css";
 
@@ -277,6 +285,7 @@ const SIDES = {
   inspector: { size: "25%", max: "40%" },
 } as const;
 const TerminalView = lazy(() => import("@/terminal").then((module) => ({ default: module.TerminalView })));
+const ReleaseNotes = lazy(() => import("@/code-preview").then((module) => ({ default: module.MarkdownPreview })));
 // The version is known from the start, so the badge shows it throughout and only its color waits on
 // the answer: grey while asking, which is quieter than a spinner that would resize a chip this small.
 const BADGE_VARIANT = {
@@ -299,15 +308,30 @@ const SIDEBAR_FONT_KEY = "lite.sidebar.fontSize";
 const INSPECTOR_FONT_KEY = "lite.inspector.fontSize";
 
 type UpdateStatus = "checking" | "available" | "rebuild" | "current" | "installing" | "error";
+type ReleaseInfo = { version: string; notes: string; available: boolean };
 
-function zoomPanelStyle(fontSize: number) {
-  const scale = fontSize / 13;
-  return {
-    width: `${100 / scale}%`,
-    height: `${100 / scale}%`,
-    transform: `scale(${scale})`,
-    transformOrigin: "top left",
-  };
+const RELEASE_AUTHOR = /@([A-Za-z0-9-]+(?:\[bot\])?)/g;
+const RELEASE_PULL = /(https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/(\d+))/g;
+
+function friendlyReleaseNotes(notes: string) {
+  return notes
+    .replace(RELEASE_AUTHOR, (_mention, author: string) => {
+      const profile = author.endsWith("[bot]")
+        ? `https://github.com/apps/${author.slice(0, -5)}`
+        : `https://github.com/${author}`;
+      return `[@${author}](${profile})`;
+    })
+    .replace(RELEASE_PULL, "[#$2]($1)");
+}
+
+function PanelZoomControls({ zoom }: { zoom: (step: -1 | 0 | 1) => void }) {
+  return (
+    <>
+      <button type="button" hidden data-context-zoom-in onClick={() => zoom(1)} />
+      <button type="button" hidden data-context-zoom-out onClick={() => zoom(-1)} />
+      <button type="button" hidden data-context-zoom-reset onClick={() => zoom(0)} />
+    </>
+  );
 }
 
 type Editable = HTMLInputElement | HTMLTextAreaElement | HTMLElement;
@@ -372,7 +396,7 @@ function menuContext(target: EventTarget | null): AppMenuContext {
   const surface = session ? null : target.closest<HTMLElement>("[data-context-surface]");
   const files = target.closest<HTMLElement>("[data-context-files]");
   // The terminal and the file viewer each zoom their own type, so the menu offers whichever owns the click.
-  const zoom = target.closest<HTMLElement>("[data-context-zoom]");
+  const zoom = target.closest<HTMLElement>("[data-context-zoom], [data-zoom-panel]");
   const selectedText =
     editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement
       ? inputSelection(editable)
@@ -532,7 +556,7 @@ function AppContextMenu({
             </ContextMenuItem>
             <ContextMenuItem onClick={() => context.zoomReset?.click()}>
               <RotateCcw />
-              Actual size
+              Zoom reset
               <ContextMenuShortcut>{shortcut}0</ContextMenuShortcut>
             </ContextMenuItem>
             {!session && (linkGroup || surfaceGroup) ? <ContextMenuSeparator /> : null}
@@ -1380,7 +1404,10 @@ function runOnStart(sessionId: string, command: string) {
     window.clearTimeout(settle);
     window.clearTimeout(patience);
     unsubscribe();
-    writeSession(sessionId, `${command}\r`);
+    // Submit exactly as the terminal does: the text and Enter are separate input events. Interactive
+    // agents may treat one combined write as pasted text and leave it sitting in the composer.
+    writeSession(sessionId, command);
+    writeSession(sessionId, "\r");
   };
   // This waits rather than sends, which is also what keeps it safe: subscribing replays what the
   // session has already said, so a listener that sent from here would be sending before the two lines
@@ -1492,6 +1519,7 @@ function App() {
   const [updateOpen, setUpdateOpen] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("checking");
   const [availableVersion, setAvailableVersion] = useState("");
+  const [releaseNotes, setReleaseNotes] = useState("");
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [updateError, setUpdateError] = useState("");
   const updateDialog = useRef<HTMLDivElement>(null);
@@ -1691,8 +1719,15 @@ function App() {
     function onKeyDown(event: KeyboardEvent) {
       if (event.defaultPrevented || (!event.metaKey && !event.ctrlKey)) return;
       if (event.target instanceof Element && event.target.closest('[role="dialog"]')) return;
+      const step = zoomStep(event.key, event.code);
+      const preview = event.target instanceof Element ? event.target.closest<HTMLElement>("[data-context-zoom]") : null;
+      if (preview && step !== undefined) {
+        const action = step === 1 ? "zoom-in" : step === -1 ? "zoom-out" : "zoom-reset";
+        preview.querySelector<HTMLButtonElement>(`[data-context-${action}]`)?.click();
+        event.preventDefault();
+        return;
+      }
       const panel = event.target instanceof Element ? event.target.closest<HTMLElement>("[data-zoom-panel]") : null;
-      const step = zoomStep(event.key);
       if (panel && step !== undefined) {
         const sidebar = panel.dataset.zoomPanel === "sidebar";
         const key = sidebar ? SIDEBAR_FONT_KEY : INSPECTOR_FONT_KEY;
@@ -1776,8 +1811,8 @@ function App() {
     const ask = ++releaseAsk.current;
     setRelease("checking");
     try {
-      const next = await invoke<string | null>("check_update");
-      if (ask === releaseAsk.current) setRelease(next ? "behind" : "current");
+      const next = await invoke<ReleaseInfo | null>("check_update");
+      if (ask === releaseAsk.current) setRelease(next?.available ? "behind" : "current");
       return next;
     } catch (reason) {
       if (ask === releaseAsk.current) setRelease("unknown");
@@ -2628,11 +2663,19 @@ function App() {
     setUpdateOpen(true);
     setUpdateStatus("checking");
     setUpdateError("");
+    setReleaseNotes("");
     try {
       // A release would replace this build rather than update it, so a local build asks its own tree.
-      const next = commit ? await invoke<string | null>("local_update") : await askRelease();
-      setAvailableVersion(next ?? "");
-      setUpdateStatus(next ? (commit ? "rebuild" : "available") : "current");
+      if (commit) {
+        const next = await invoke<string | null>("local_update");
+        setAvailableVersion(next ?? "");
+        setUpdateStatus(next ? "rebuild" : "current");
+      } else {
+        const next = await askRelease();
+        setAvailableVersion(next?.version ?? "");
+        setReleaseNotes(next?.notes ?? "");
+        setUpdateStatus(next?.available ? "available" : "current");
+      }
     } catch (reason) {
       setUpdateError(String(reason));
       setUpdateStatus("error");
@@ -2853,8 +2896,10 @@ function App() {
                 data-context-surface
                 data-zoom-panel="sidebar"
                 className="flex h-full w-full flex-col bg-sidebar text-sidebar-foreground"
-                style={zoomPanelStyle(sidebarFontSize)}
               >
+                <PanelZoomControls
+                  zoom={(step) => setSidebarFontSize((current) => zoomedFontSize(SIDEBAR_FONT_KEY, current, step))}
+                />
                 {shut.sidebar ? (
                   <ScrollArea className="min-h-0 flex-1">
                     <div className="flex animate-in flex-col items-center gap-0.5 py-1.5 fade-in duration-200">
@@ -2955,7 +3000,11 @@ function App() {
                       </ActionIconButton>
                     </div>
                     <ScrollArea className="min-h-0 flex-1">
-                      <div className="space-y-0.5 px-2 pb-2" data-session-list>
+                      <div
+                        className="space-y-0.5 px-2 pb-2"
+                        data-session-list
+                        style={contentZoomStyle(sidebarFontSize)}
+                      >
                         {query && !visible.length ? (
                           <p className="px-2 py-1.5 text-xs text-muted-foreground">No session matches “{query}”.</p>
                         ) : null}
@@ -3184,15 +3233,17 @@ function App() {
                   maxSize={SIDES.inspector.max}
                   onResize={(size) => rail("inspector", size)}
                 >
-                  <aside
-                    data-zoom-panel="inspector"
-                    className="h-full w-full border-l"
-                    style={zoomPanelStyle(inspectorFontSize)}
-                  >
+                  <aside data-zoom-panel="inspector" className="h-full w-full border-l">
+                    <PanelZoomControls
+                      zoom={(step) =>
+                        setInspectorFontSize((current) => zoomedFontSize(INSPECTOR_FONT_KEY, current, step))
+                      }
+                    />
                     <PanelBoundary key={selected.id}>
                       <Inspector
                         session={selected}
                         remote={remote}
+                        fontSize={inspectorFontSize}
                         collapsed={shut.inspector}
                         onExpand={() =>
                           glide(inspectorPanel.current, share(inspectorPanel.current, SIDES.inspector.size))
@@ -3209,7 +3260,7 @@ function App() {
             <DialogContent
               ref={updateDialog}
               initialFocus={updateDialog}
-              className="sm:max-w-lg"
+              className="sm:max-w-2xl"
               showCloseButton={updateStatus !== "checking" && updateStatus !== "installing"}
             >
               <DialogHeader>
@@ -3289,6 +3340,15 @@ function App() {
                     ) : null}
                   </dl>
                 )}
+                {releaseNotes && updateStatus !== "checking" && updateStatus !== "installing" ? (
+                  <Suspense fallback={<Spinner className="mx-auto mt-4 size-5 text-muted-foreground" />}>
+                    <ReleaseNotes
+                      source={friendlyReleaseNotes(releaseNotes)}
+                      className="mt-4 border-t pt-3 text-sm [&>h2:first-child]:mt-0"
+                      onOpenLink={(url) => void invoke("open_url", { url })}
+                    />
+                  </Suspense>
+                ) : null}
               </DialogBody>
 
               {updateStatus === "available" ? (

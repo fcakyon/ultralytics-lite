@@ -76,7 +76,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { SEMANTIC_PROGRESS_CLASSES, type SemanticTone } from "@/lib/semantic-styles";
 import { without } from "@/lib/utils";
 import { MAX_OUTPUT_BYTES, readOutput, subscribeOutput } from "@/output-store";
-import { storedFontSize, zoomedFontSize, zoomStep } from "@/theme";
+import { contentZoomStyle } from "@/theme";
 import {
   type DirectoryCursor,
   type DirectoryListing,
@@ -360,7 +360,11 @@ const FILE_FAMILIES: (FileKind & { extensions: string[] })[] = [
   { icon: FileCode, color: "text-orange-500", extensions: ["html", "htm", "xml", "vue", "svelte"] },
   { icon: FileCode, color: "text-fuchsia-500", extensions: ["css", "scss", "sass", "less"] },
   { icon: FileJson, color: "text-amber-500", extensions: ["json", "jsonc", "json5"] },
-  { icon: FileCog, color: "text-stone-500", extensions: ["yaml", "yml", "toml", "ini", "cfg", "conf", "editorconfig"] },
+  {
+    icon: FileCog,
+    color: "text-violet-500",
+    extensions: ["yaml", "yml", "toml", "ini", "cfg", "conf", "editorconfig"],
+  },
   { icon: FileCog, color: "text-stone-500", extensions: ["gitignore", "gitattributes", "dockerignore"] },
   { icon: FileKey, color: "text-amber-600", extensions: ["env", "pem", "key", "crt", "cert"] },
   { icon: FileLock, color: "text-stone-500", extensions: ["lock", "lockb"] },
@@ -779,15 +783,10 @@ function FileTree({
   );
 }
 
-const PREVIEW_FONT_KEY = "lite.preview.fontSize";
 const RENDERED_FILE = /\.(?:html?|mdx?|svg)$/i;
 
 function usePreviewViewer<T extends HTMLElement>(onBack: () => void) {
   const viewer = useRef<T>(null);
-  const [fontSize, setFontSize] = useState(() => storedFontSize(PREVIEW_FONT_KEY));
-  const zoom = useCallback((step: -1 | 0 | 1) => {
-    setFontSize((current) => zoomedFontSize(PREVIEW_FONT_KEY, current, step));
-  }, []);
 
   useEffect(() => viewer.current?.focus(), []);
   useEffect(() => {
@@ -808,15 +807,10 @@ function usePreviewViewer<T extends HTMLElement>(onBack: () => void) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onBack]);
 
-  return { viewer, fontSize, zoom };
+  return viewer;
 }
 
-function previewKeyDown(
-  event: ReactKeyboardEvent<HTMLElement>,
-  onClose: () => void,
-  zoom: (step: -1 | 0 | 1) => void,
-  onSave?: () => void,
-) {
+function previewKeyDown(event: ReactKeyboardEvent<HTMLElement>, onClose: () => void, onSave?: () => void) {
   const command = event.metaKey || (!navigator.platform.includes("Mac") && event.ctrlKey);
   if (!command) return;
   if (onSave && event.key.toLowerCase() === "s") {
@@ -829,10 +823,6 @@ function previewKeyDown(
     onClose();
     return;
   }
-  const step = zoomStep(event.key);
-  if (step === undefined) return;
-  event.preventDefault();
-  zoom(step);
 }
 
 function PreviewHeader({
@@ -883,25 +873,13 @@ function PreviewHeader({
   );
 }
 
-function PreviewZoomControls({ zoom }: { zoom: (step: -1 | 0 | 1) => void }) {
-  return (
-    <>
-      <button type="button" hidden data-context-zoom-in onClick={() => zoom(1)} />
-      <button type="button" hidden data-context-zoom-out onClick={() => zoom(-1)} />
-      <button type="button" hidden data-context-zoom-reset onClick={() => zoom(0)} />
-    </>
-  );
-}
-
-// The preview inherits its type from here, so one zoom scales code, prose, and the line-number gutter
-// together while the header chrome keeps its own size. Zooming lives in this component so a step
-// re-renders the view alone, never the tree hidden behind it.
 function FileViewer({
   entry,
   source,
   draft,
   error,
   loading,
+  fontSize,
   onBack,
   onDraftChange,
   onSave,
@@ -911,6 +889,7 @@ function FileViewer({
   draft: string;
   error: string;
   loading: boolean;
+  fontSize: number;
   onBack: () => void;
   onDraftChange: (contents: string) => void;
   onSave: (contents: string) => Promise<void>;
@@ -919,18 +898,13 @@ function FileViewer({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [discardOpen, setDiscardOpen] = useState(false);
-  const editor = useRef<HTMLTextAreaElement>(null);
   const dirty = draft !== source;
   const renderable = RENDERED_FILE.test(entry.path);
   const lineEnding = source.includes("\r\n") ? "\r\n" : "\n";
-  const { viewer, fontSize, zoom } = usePreviewViewer<HTMLDivElement>(() => {
+  const viewer = usePreviewViewer<HTMLDivElement>(() => {
     if (dirty) setDiscardOpen(true);
     else onBack();
   });
-
-  useEffect(() => {
-    if (!loading && view === "source") editor.current?.focus();
-  }, [loading, view]);
 
   async function save() {
     setSaving(true);
@@ -957,10 +931,8 @@ function FileViewer({
       onValueChange={(value) => setView(value as "source" | "preview")}
       aria-label={entry.name}
       tabIndex={-1}
-      data-context-zoom
       className="flex min-h-0 flex-1 flex-col gap-0 outline-none"
-      style={{ fontSize, lineHeight: 1.6 }}
-      onKeyDown={(event) => previewKeyDown(event, closeFile, zoom, () => !saving && dirty && void save())}
+      onKeyDown={(event) => previewKeyDown(event, closeFile, () => !saving && dirty && void save())}
     >
       <Dialog open={discardOpen} onOpenChange={setDiscardOpen}>
         <DialogContent>
@@ -1022,41 +994,38 @@ function FileViewer({
           </ActionIconButton>
         ) : null}
       </PreviewHeader>
-      <PreviewZoomControls zoom={zoom} />
-      <ScrollArea className="min-h-0 flex-1">
-        {loading ? (
-          <Loading label="Opening file…" />
-        ) : error ? (
-          <div className="p-3 text-xs text-muted-foreground">{error}</div>
-        ) : (
-          <>
-            <TabsContent value="source" className="min-h-full">
-              <div className="flex min-h-full flex-col">
-                <textarea
-                  ref={editor}
-                  name="file-contents"
-                  aria-label={`Edit ${entry.name}`}
-                  spellCheck={false}
-                  value={draft}
-                  className="min-h-[calc(100vh-8rem)] w-full flex-1 resize-none bg-transparent p-3 font-mono outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                  onChange={(event) =>
-                    onDraftChange(
-                      lineEnding === "\r\n" ? event.target.value.replace(/\r?\n/g, "\r\n") : event.target.value,
-                    )
-                  }
-                />
-              </div>
+      {loading ? (
+        <Loading label="Opening file…" />
+      ) : error ? (
+        <div className="p-3 text-xs text-muted-foreground">{error}</div>
+      ) : (
+        <>
+          <TabsContent value="source" keepMounted className="min-h-0 overflow-hidden">
+            <Suspense fallback={<Loading label="Highlighting source…" />}>
+              <CodePreview
+                path={entry.path}
+                source={draft}
+                editable
+                fontSize={fontSize}
+                onChange={(contents) =>
+                  onDraftChange(lineEnding === "\r\n" ? contents.replace(/\r?\n/g, "\r\n") : contents)
+                }
+              />
+            </Suspense>
+          </TabsContent>
+          {renderable ? (
+            <TabsContent value="preview" keepMounted className="min-h-0 overflow-hidden">
+              <ScrollArea className="size-full">
+                <div style={contentZoomStyle(fontSize)}>
+                  <Suspense fallback={<Loading label="Opening preview…" />}>
+                    <CodePreview path={entry.path} source={draft} rendered />
+                  </Suspense>
+                </div>
+              </ScrollArea>
             </TabsContent>
-            {renderable ? (
-              <TabsContent value="preview" className="min-h-full">
-                <Suspense fallback={<Loading label="Opening preview…" />}>
-                  <CodePreview path={entry.path} source={draft} rendered />
-                </Suspense>
-              </TabsContent>
-            ) : null}
-          </>
-        )}
-      </ScrollArea>
+          ) : null}
+        </>
+      )}
       {saveError ? (
         <p role="alert" className="shrink-0 border-t p-2 text-xs text-destructive">
           {saveError}
@@ -1075,7 +1044,17 @@ interface FileEditorState {
 
 const fileEditorsBySession = new Map<string, FileEditorState>();
 
-function FilesPanel({ root, rootId, sessionId }: { root: string; rootId: string; sessionId: string }) {
+function FilesPanel({
+  root,
+  rootId,
+  sessionId,
+  fontSize,
+}: {
+  root: string;
+  rootId: string;
+  sessionId: string;
+  fontSize: number;
+}) {
   const [cached] = useState(() => {
     const current = fileEditorsBySession.get(sessionId);
     if (current?.rootId === rootId) return current;
@@ -1161,6 +1140,7 @@ function FilesPanel({ root, rootId, sessionId }: { root: string; rootId: string;
           draft={draft}
           error={error}
           loading={loading}
+          fontSize={fontSize}
           onBack={closeFile}
           onDraftChange={changeDraft}
           onSave={saveFile}
@@ -1169,7 +1149,9 @@ function FilesPanel({ root, rootId, sessionId }: { root: string; rootId: string;
       <div data-context-files className={`min-h-0 flex-1 flex-col ${selected ? "hidden" : "flex"}`}>
         <SearchInput value={query} placeholder="Search files" onChange={setQuery} />
         <ScrollArea className="min-h-0 flex-1">
-          <FileTree key={rootId} root={root} rootId={rootId} query={query} onOpen={(entry) => void openFile(entry)} />
+          <div style={contentZoomStyle(fontSize)}>
+            <FileTree key={rootId} root={root} rootId={rootId} query={query} onOpen={(entry) => void openFile(entry)} />
+          </div>
         </ScrollArea>
       </div>
     </div>
@@ -1181,25 +1163,25 @@ function DiffViewer({
   source,
   error,
   loading,
+  fontSize,
   onBack,
 }: {
   path: string;
   source: string;
   error: string;
   loading: boolean;
+  fontSize: number;
   onBack: () => void;
 }) {
-  const { viewer, fontSize, zoom } = usePreviewViewer<HTMLElement>(onBack);
+  const viewer = usePreviewViewer<HTMLElement>(onBack);
 
   return (
     <section
       ref={viewer}
       aria-label={`Diff for ${path}`}
       tabIndex={-1}
-      data-context-zoom
       className="flex h-full min-h-0 flex-col outline-none"
-      style={{ fontSize, lineHeight: 1.6 }}
-      onKeyDown={(event) => previewKeyDown(event, onBack, zoom)}
+      onKeyDown={(event) => previewKeyDown(event, onBack)}
     >
       <PreviewHeader
         path={path}
@@ -1213,21 +1195,22 @@ function DiffViewer({
         }
         onClose={onBack}
       />
-      <PreviewZoomControls zoom={zoom} />
       <ScrollArea className="min-h-0 flex-1">
-        {loading ? (
-          <Loading label="Reading diff…" />
-        ) : error ? (
-          <p role="alert" className="p-3 text-xs text-destructive">
-            {error}
-          </p>
-        ) : source ? (
-          <Suspense fallback={<Loading label="Opening diff…" />}>
-            <CodePreview path={`${path}.diff`} source={source} />
-          </Suspense>
-        ) : (
-          <p className="p-3 text-xs text-muted-foreground">This file has no text diff.</p>
-        )}
+        <div style={contentZoomStyle(fontSize)}>
+          {loading ? (
+            <Loading label="Reading diff…" />
+          ) : error ? (
+            <p role="alert" className="p-3 text-xs text-destructive">
+              {error}
+            </p>
+          ) : source ? (
+            <Suspense fallback={<Loading label="Opening diff…" />}>
+              <CodePreview path={`${path}.diff`} source={source} />
+            </Suspense>
+          ) : (
+            <p className="p-3 text-xs text-muted-foreground">This file has no text diff.</p>
+          )}
+        </div>
       </ScrollArea>
     </section>
   );
@@ -1338,11 +1321,13 @@ function GitPanel({
   sessionId,
   remote,
   active,
+  fontSize,
 }: {
   rootId: string;
   sessionId: string;
   remote: string;
   active: boolean;
+  fontSize: number;
 }) {
   const [urls, setUrls] = useState(() => namedInSession(sessionId, remote));
   const [status, setStatus] = useState<GitStatus | null>();
@@ -1460,12 +1445,19 @@ function GitPanel({
   return (
     <div className="flex h-full min-h-0 flex-col">
       {diffPath ? (
-        <DiffViewer path={diffPath} source={diffSource} error={diffError} loading={diffLoading} onBack={closeDiff} />
+        <DiffViewer
+          path={diffPath}
+          source={diffSource}
+          error={diffError}
+          loading={diffLoading}
+          fontSize={fontSize}
+          onBack={closeDiff}
+        />
       ) : null}
       <div className={`min-h-0 flex-1 flex-col ${diffPath ? "hidden" : "flex"}`}>
         <SearchInput value={query} placeholder="Search items" onChange={setQuery} />
         <ScrollArea className="min-h-0 flex-1">
-          <div className="flex flex-col gap-3 p-3">
+          <div className="flex flex-col gap-3 p-3" style={contentZoomStyle(fontSize)}>
             {error ? <p className="text-sm text-destructive">{error}</p> : null}
             {!error && status === undefined ? <Loading label="Reading Git status…" /> : null}
             {shown.map((repository) => (
@@ -1504,7 +1496,7 @@ function missingUsage(session: Session): string {
   return `${sessionLabel(session)} reports session context after its first response.`;
 }
 
-function UsagePanel({ session }: { session: Session }) {
+function UsagePanel({ session, fontSize }: { session: Session; fontSize: number }) {
   const [usage, setUsage] = useState<UsageSnapshot | null | undefined>(() => usageCache.get(session.id));
   const [error, setError] = useState("");
 
@@ -1533,7 +1525,7 @@ function UsagePanel({ session }: { session: Session }) {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <ScrollArea className="min-h-0 flex-1">
-        <div className="p-3">
+        <div className="p-3" style={contentZoomStyle(fontSize)}>
           <div className="mb-3 flex items-center gap-2 text-sm font-medium">
             <ProviderIcon agent={session.agent} provider={session.provider} className="size-5" />
             {session.agent === "codex" && session.provider ? providerLabel(session.provider) : sessionLabel(session)}
@@ -1605,12 +1597,14 @@ function UsagePanel({ session }: { session: Session }) {
 export function Inspector({
   session,
   remote,
+  fontSize,
   collapsed,
   onExpand,
   onCollapse,
 }: {
   session: Session;
   remote: string;
+  fontSize: number;
   collapsed: boolean;
   onExpand: () => void;
   onCollapse: () => void;
@@ -1734,6 +1728,7 @@ export function Inspector({
                 root={session.cwd}
                 rootId={session.rootId}
                 sessionId={session.id}
+                fontSize={fontSize}
               />
             </TabsContent>
           ) : null}
@@ -1745,12 +1740,13 @@ export function Inspector({
                 sessionId={session.id}
                 remote={remote}
                 active={tab === "git" && !collapsed}
+                fontSize={fontSize}
               />
             </TabsContent>
           ) : null}
           {visited.has("usage") ? (
             <TabsContent value="usage" keepMounted className="min-h-0 overflow-hidden">
-              <UsagePanel key={reload.usage} session={session} />
+              <UsagePanel key={reload.usage} session={session} fontSize={fontSize} />
             </TabsContent>
           ) : null}
         </Tabs>

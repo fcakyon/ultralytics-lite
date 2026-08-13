@@ -17,7 +17,6 @@ import {
 import { type ReactNode, useCallback, useEffect, useState } from "react";
 
 import { GitHubLogomark, ProviderIcon, UltralyticsLogomark } from "@/brand-icons";
-import { Badge } from "@/components/ui/badge";
 import { ActionIconButton, Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -45,10 +44,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { without } from "@/lib/utils";
 import { AUTH_PROVIDERS, type ProviderAuth, ProviderAuthDescription } from "@/provider-auth";
 import type { Theme } from "@/theme";
-import type { Agent } from "@/types";
+import { type Agent, sessionLabel } from "@/types";
 
-// Each CLI signs in on its own; a key here is the alternative for anyone who would rather not.
-const providers = Object.values(AUTH_PROVIDERS).filter((provider) => "variable" in provider);
+const providers = Object.values(AUTH_PROVIDERS);
 
 export function SettingsDialog({
   open: isOpen,
@@ -251,24 +249,23 @@ export function SettingsDialog({
                         <ProviderIcon agent={option.agent} provider={option.provider} className="size-5" />
                       </ItemMedia>
                       <ItemContent>
-                        <ItemTitle>
-                          {option.label}
-                          <Badge variant="outline" className="font-mono font-normal">
-                            {option.variable}
-                          </Badge>
-                        </ItemTitle>
+                        <ItemTitle>{sessionLabel(option)}</ItemTitle>
                         <ProviderAuthDescription provider={option} status={status} />
                       </ItemContent>
                       {open ? null : (
                         <ItemActions>
                           {!status?.keyHint && !status?.cliAuthMethod && option.signIn ? (
                             <Button variant="outline" size="sm" onClick={() => onSignIn(option.agent)}>
-                              Sign in
+                              {option.id === "qwen" ? "Set up" : "Sign in"}
                             </Button>
                           ) : null}
-                          <Button variant="ghost" size="sm" onClick={() => edit(option.id, true)}>
-                            {status?.keyHint || status?.cliAuthMethod === "apiKey" ? "Replace API key" : "Use API key"}
-                          </Button>
+                          {"variable" in option ? (
+                            <Button variant="ghost" size="sm" onClick={() => edit(option.id, true)}>
+                              {status?.keyHint || status?.cliAuthMethod === "apiKey"
+                                ? "Replace API key"
+                                : "Use API key"}
+                            </Button>
+                          ) : null}
                           {status?.keyHint || status?.cliKeyHint ? (
                             <ActionIconButton
                               size="icon-sm"
@@ -283,7 +280,7 @@ export function SettingsDialog({
                           ) : null}
                         </ItemActions>
                       )}
-                      {open ? (
+                      {open && "variable" in option ? (
                         <ItemFooter>
                           <InputGroup>
                             <InputGroupInput
