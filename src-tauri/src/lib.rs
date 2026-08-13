@@ -22,6 +22,14 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_updater::UpdaterExt;
 use tungstenite::Message;
 
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSObject, NSObjectProtocol};
+#[cfg(target_os = "macos")]
+use objc2_user_notifications::{
+    UNNotificationDefaultActionIdentifier, UNNotificationResponse, UNUserNotificationCenter,
+    UNUserNotificationCenterDelegate,
+};
+
 const MAX_FILE_BYTES: u64 = 500_000;
 const DIRECTORY_PAGE_SIZE: usize = 250;
 const MAX_GIT_CHANGES: usize = 500;
@@ -40,6 +48,68 @@ const SUPPORTED_KEYS: [&str; 6] = [
     "kimi",
 ];
 
+#[derive(Default)]
+struct PendingNotification(Mutex<Option<String>>);
+
+#[cfg(target_os = "macos")]
+objc2::define_class!(
+    #[unsafe(super(NSObject))]
+    #[ivars = AppHandle]
+    struct NotificationDelegate;
+
+    unsafe impl NSObjectProtocol for NotificationDelegate {}
+
+    unsafe impl UNUserNotificationCenterDelegate for NotificationDelegate {
+        #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+        #[allow(non_snake_case)]
+        fn userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler(
+            &self,
+            _center: &UNUserNotificationCenter,
+            response: &UNNotificationResponse,
+            completion_handler: &block2::DynBlock<dyn Fn()>,
+        ) {
+            use objc2::DefinedClass;
+
+            let action = response.actionIdentifier();
+            // SAFETY: UserNotifications provides this immutable framework identifier.
+            if &*action == unsafe { UNNotificationDefaultActionIdentifier } {
+                let session_id = response.notification().request().identifier().to_string();
+                *self
+                    .ivars()
+                    .state::<PendingNotification>()
+                    .0
+                    .lock()
+                    .unwrap() = Some(session_id);
+                let _ = self.ivars().emit("notification-clicked", ());
+            }
+            completion_handler.call(());
+        }
+    }
+);
+
+#[cfg(target_os = "macos")]
+impl NotificationDelegate {
+    fn new(app: AppHandle) -> objc2::rc::Retained<Self> {
+        use objc2::AnyThread;
+
+        let this = Self::alloc().set_ivars(app);
+        unsafe { objc2::msg_send![super(this), init] }
+    }
+}
+
+#[cfg(target_os = "macos")]
+static NOTIFICATION_DELEGATE: std::sync::OnceLock<objc2::rc::Retained<NotificationDelegate>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn install_notification_delegate(app: &AppHandle) {
+    use objc2::runtime::ProtocolObject;
+
+    let delegate = NOTIFICATION_DELEGATE.get_or_init(|| NotificationDelegate::new(app.clone()));
+    UNUserNotificationCenter::currentNotificationCenter()
+        .setDelegate(Some(ProtocolObject::from_ref(&**delegate)));
+}
+
 #[tauri::command]
 fn notifications_supported() -> bool {
     cfg!(target_os = "macos")
@@ -48,6 +118,11 @@ fn notifications_supported() -> bool {
                 .ancestors()
                 .any(|path| path.extension().is_some_and(|extension| extension == "app"))
         })
+}
+
+#[tauri::command]
+fn notification_session(pending: State<'_, PendingNotification>) -> Option<String> {
+    pending.0.lock().unwrap().take()
 }
 
 #[cfg(target_os = "macos")]
@@ -77,7 +152,7 @@ fn request_notification_permission() -> bool {
 
 #[cfg(target_os = "macos")]
 #[tauri::command]
-fn send_notification(title: String) {
+fn send_notification(title: String, session_id: String) {
     use objc2_foundation::NSString;
     use objc2_user_notifications::{
         UNMutableNotificationContent, UNNotificationRequest, UNUserNotificationCenter,
@@ -88,9 +163,9 @@ fn send_notification(title: String) {
     }
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(&title));
-    content.setBody(&NSString::from_str("This session needs your attention."));
+    content.setBody(&NSString::from_str("Ready"));
     let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
-        &NSString::from_str(&uuid::Uuid::new_v4().to_string()),
+        &NSString::from_str(&session_id),
         &content,
         None,
     );
@@ -100,7 +175,7 @@ fn send_notification(title: String) {
 
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
-fn send_notification() {}
+fn send_notification(_title: String, _session_id: String) {}
 
 #[derive(Clone, Copy)]
 struct CodexProvider {
@@ -5091,13 +5166,17 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Sessions::default())
         .manage(WakeLock::default())
+        .manage(PendingNotification::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(load_roots(app.handle()));
             app.manage(load_provider_sessions(app.handle()));
             app.manage(load_codex_server(app.handle())?);
             #[cfg(target_os = "macos")]
-            describe_app(app.handle())?;
+            {
+                describe_app(app.handle())?;
+                install_notification_delegate(app.handle());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -5138,6 +5217,7 @@ pub fn run() {
             save_api_key,
             delete_api_key,
             notifications_supported,
+            notification_session,
             request_notification_permission,
             send_notification,
             check_update,

@@ -683,11 +683,11 @@ const SESSION_STATUS = {
   working: { dot: "bg-sky-500 animate-pulse motion-reduce:animate-none", label: "Connected, working" },
   attention: {
     dot: "bg-amber-500 animate-attention motion-reduce:animate-none",
-    label: "Connected, needs attention",
+    label: "Connected, ready",
   },
 } as const;
 const SESSION_STATE_LABELS = {
-  attention: "Needs attention",
+  attention: "Ready",
   working: "Working",
   idle: "Idle",
   disconnected: "Disconnected",
@@ -1871,6 +1871,12 @@ function App() {
     let unlistenOutput: (() => void) | undefined;
     let unlistenExit: (() => void) | undefined;
     let unlistenAgent: (() => void) | undefined;
+    let unlistenNotification: (() => void) | undefined;
+    const openNotification = () =>
+      invoke<string | null>("notification_session").then((sessionId) => {
+        const session = sessionsRef.current.find((item) => item.id === sessionId);
+        if (session) openRef.current(session);
+      });
     void Promise.all([
       listen<{ sessionId: string; runId: string; data: number[] }>("pty-output", ({ payload }) => {
         if (runs.current.get(payload.sessionId) !== payload.runId) return;
@@ -1884,7 +1890,7 @@ function App() {
         ) {
           const session = sessionsRef.current.find((item) => item.id === payload.sessionId);
           if (notificationsRef.current && session)
-            void invoke("send_notification", { title: session.name }).catch(() => {});
+            void invoke("send_notification", { title: session.name, sessionId: session.id }).catch(() => {});
         }
         if (activity !== false) markWorking(payload.sessionId);
       }),
@@ -1910,16 +1916,20 @@ function App() {
           return next;
         });
       }),
-    ]).then(([output, exit, agent]) => {
+      listen("notification-clicked", () => void openNotification()),
+    ]).then(([output, exit, agent, notification]) => {
       if (disposed) {
         output();
         exit();
         agent();
+        notification();
         return;
       }
       unlistenOutput = output;
       unlistenExit = exit;
       unlistenAgent = agent;
+      unlistenNotification = notification;
+      void openNotification();
     });
     const timers = workTimers.current;
     return () => {
@@ -1927,6 +1937,7 @@ function App() {
       unlistenOutput?.();
       unlistenExit?.();
       unlistenAgent?.();
+      unlistenNotification?.();
       for (const timer of timers.values()) window.clearTimeout(timer);
       timers.clear();
     };
@@ -2875,9 +2886,7 @@ function App() {
                                 variant="ghost"
                                 size="icon-sm"
                                 aria-pressed={session.id === selectedId}
-                                aria-label={
-                                  attention.includes(session.id) ? `${session.name}; needs attention` : session.name
-                                }
+                                aria-label={attention.includes(session.id) ? `${session.name}; ready` : session.name}
                                 data-context-session={session.id}
                                 className={
                                   session.id === selectedId ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/60"
