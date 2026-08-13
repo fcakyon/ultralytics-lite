@@ -1,7 +1,7 @@
 // Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import { invoke } from "@tauri-apps/api/core";
-import { FolderOpen } from "lucide-react";
+import { Download, FolderOpen, RefreshCw } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 
 import { ProviderIcon } from "@/brand-icons";
@@ -403,13 +403,11 @@ export function NewSessionDialog({
                   // A registry that could not answer knows of no update, so only one it reported is
                   // offered — by the button and by the mark beside the version alike.
                   const updatable = managed && update === true;
-                  // What the button offers, if it is there at all, and the room the tile keeps for it:
-                  // a tile only ever offers the one action, so each reserves the width of its own
-                  // widest label rather than both settling for the wider.
+                  // What the icon offers, if it is there at all.
                   const action = state?.installable
-                    ? ({ label: "Install", working: "Installing…", room: "pr-28" } as const)
+                    ? ({ label: "Install", working: "Installing" } as const)
                     : updatable
-                      ? ({ label: "Update", working: "Updating…", room: "pr-24" } as const)
+                      ? ({ label: "Update", working: "Updating" } as const)
                       : undefined;
                   const busy = installing === option.id;
                   const authProvider = "configured" in option ? option : undefined;
@@ -420,7 +418,7 @@ export function NewSessionDialog({
                         type="button"
                         size="lg"
                         variant={active ? "secondary" : "outline"}
-                        className={`h-14 w-full min-w-0 justify-start overflow-hidden pl-3 ${action?.room ?? "pr-3"}`}
+                        className={`h-14 w-full min-w-0 justify-start overflow-hidden pl-3 ${action ? "pr-11" : "pr-3"}`}
                         aria-pressed={active}
                         disabled={Boolean(installing)}
                         title={"note" in option ? option.note : sessionLabel(option)}
@@ -445,17 +443,28 @@ export function NewSessionDialog({
                         </div>
                       </Button>
                       {action ? (
-                        <Button
+                        <ActionIconButton
                           type="button"
-                          size="sm"
-                          variant="ghost"
-                          className="absolute top-1/2 right-1.5 -translate-y-1/2"
+                          size="icon"
+                          variant="outline"
+                          className="absolute top-1/2 right-2 -mt-4"
+                          tooltip={
+                            busy
+                              ? `${action.working} ${sessionLabel(option)}…`
+                              : action.label === "Install"
+                                ? `Install ${sessionLabel(option)}`
+                                : `Update ${sessionLabel(option)} to the latest version`
+                          }
+                          aria-label={
+                            action.label === "Install"
+                              ? `Install ${sessionLabel(option)}`
+                              : `Update ${sessionLabel(option)} to the latest version`
+                          }
                           disabled={Boolean(installing)}
                           onClick={() => void install(option)}
                         >
-                          {busy ? <Spinner /> : null}
-                          {busy ? action.working : action.label}
-                        </Button>
+                          {busy ? <Spinner /> : action.label === "Install" ? <Download /> : <RefreshCw />}
+                        </ActionIconButton>
                       ) : null}
                     </div>
                   );
