@@ -934,6 +934,24 @@ fn default_directory_path(app: &AppHandle) -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
+fn typed_path(app: &AppHandle, path: &str) -> Result<PathBuf, String> {
+    let path = match path.trim().strip_prefix('~') {
+        Some(rest) => app
+            .path()
+            .home_dir()
+            .map_err(|error| error.to_string())?
+            .join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(path.trim()),
+    };
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[cfg(unix)]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -1235,24 +1253,30 @@ async fn choose_directory(
     grant_directory(&app, &roots, path, None).map(Some)
 }
 
-// A typed path is a folder like any other: it has to exist and it goes through the same grant.
+// A typed path is a folder like any other and goes through the same grant. The field tells the user
+// before submit when a missing folder will be created; an existing non-folder remains invalid.
 #[tauri::command]
 async fn use_directory(
     app: AppHandle,
     roots: State<'_, Roots>,
     path: String,
 ) -> Result<DirectoryGrant, String> {
-    let path = path.trim();
-    let path = match path.strip_prefix('~') {
-        Some(rest) => app
-            .path()
-            .home_dir()
-            .map_err(|error| error.to_string())?
-            .join(rest.trim_start_matches(['/', '\\'])),
-        None => PathBuf::from(path),
-    };
+    let path = typed_path(&app, &path)?;
+    if !path.exists() {
+        // Resolve the closest existing ancestor before creating through it: a symlink into a sensitive
+        // configuration folder must not let the final canonical-path check happen after the mutation.
+        let mut ancestor = path.as_path();
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().ok_or("That folder cannot be created")?;
+        }
+        let ancestor = fs::canonicalize(ancestor).map_err(|error| error.to_string())?;
+        if is_sensitive_root(&ancestor) || is_sensitive_root(&path) {
+            return Err("Credential and configuration folders cannot be opened".into());
+        }
+        fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    }
     if !path.is_dir() {
-        return Err("That folder does not exist".into());
+        return Err("That path is not a folder".into());
     }
     let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
     write_atomic(&last_directory_path(&app)?, path_text(&path).as_bytes())?;
@@ -4186,38 +4210,50 @@ struct Repository {
     worktree: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryProbe {
+    exists: bool,
+    is_directory: bool,
+    repository: Option<Repository>,
+}
+
 // Whether a folder sits inside a repository, where its main checkout is, and the next sibling path
 // available for a Lite worktree. The new-session dialog asks before it has granted anything, so this
 // takes the bare path — the same folder the grant would name — and only reads from it.
 #[tauri::command]
-async fn git_repo(app: AppHandle, path: String) -> Result<Option<Repository>, String> {
-    let path = path.trim();
-    let path = match path.strip_prefix('~') {
-        Some(rest) => app
-            .path()
-            .home_dir()
-            .map_err(|error| error.to_string())?
-            .join(rest.trim_start_matches(['/', '\\'])),
-        None => PathBuf::from(path),
-    };
+async fn directory_probe(app: AppHandle, path: String) -> Result<DirectoryProbe, String> {
+    let path = typed_path(&app, &path)?;
     if !path.is_dir() {
-        return Ok(None);
+        return Ok(DirectoryProbe {
+            exists: path.exists(),
+            is_directory: false,
+            repository: None,
+        });
     }
     // Canonicalized like the grant's path would be, so the root can be compared with session cwds.
     let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
     let git = resolve_executable("git").unwrap_or_else(|| "git".into());
     let Ok(root) = main_checkout(&git, &path) else {
-        return Ok(None);
+        return Ok(DirectoryProbe {
+            exists: true,
+            is_directory: true,
+            repository: None,
+        });
     };
     let checkout = command_output(&git, &path, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
         .unwrap_or_else(|_| root.clone());
     let candidate = next_worktree(&git, &root, &checkout)?;
-    Ok(Some(Repository {
-        worktree: path_text(&candidate.path),
-        branch: candidate.branch,
-        root: path_text(&root),
-    }))
+    Ok(DirectoryProbe {
+        exists: true,
+        is_directory: true,
+        repository: Some(Repository {
+            worktree: path_text(&candidate.path),
+            branch: candidate.branch,
+            root: path_text(&root),
+        }),
+    })
 }
 
 // A session that shares its project with another gets the next numbered sibling folder. A missing
@@ -5085,7 +5121,7 @@ pub fn run() {
             git_status,
             git_diff,
             git_remote,
-            git_repo,
+            directory_probe,
             create_worktree,
             restore_worktree,
             worktree_state,
