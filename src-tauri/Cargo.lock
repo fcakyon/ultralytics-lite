@@ -980,6 +980,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -1942,7 +1943,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lite"
-version = "0.0.30"
+version = "0.0.31"
 dependencies = [
  "atomicwrites",
  "block2",
@@ -1953,6 +1954,8 @@ dependencies = [
  "objc2-io-kit",
  "objc2-user-notifications",
  "portable-pty",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sysinfo",
@@ -2820,6 +2823,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
