@@ -24,17 +24,12 @@ import { defaultSessionName, type Session, sessionLabel } from "@/types";
 
 const choices = [...Object.values(AUTH_PROVIDERS), { id: "shell", agent: "shell" as const, provider: undefined }];
 const harnesses = [...new Set(choices.map((option) => option.agent).filter((agent) => agent !== "shell"))];
+const CHOICE_KEY = "lite.newSession.choice.v1";
+const NAME_KEY = "lite.newSession.name.v1";
+const WORKTREE_KEY = "lite.newSession.worktree.v1";
 
 // The quiet heading that separates the two questions the dialog asks, in the sidebar's own label style.
 const SECTION = "text-[11px] font-medium tracking-wide text-muted-foreground uppercase";
-
-// Two sessions share a project when they sit in the same repository — which a worktree's path
-// cannot say, since Lite worktrees live beside the checkout rather than under it, so the repo
-// recorded at creation answers. Sessions older than that record fall back to their path.
-function sharesRepo(session: Session, repo: string) {
-  if (session.repo) return session.repo === repo;
-  return session.cwd === repo || session.cwd.startsWith(`${repo}/`) || session.cwd.startsWith(`${repo}\\`);
-}
 
 interface DirectoryGrant {
   id: string;
@@ -63,14 +58,15 @@ export function NewSessionDialog({
   open: isOpen,
   onOpenChange,
   onCreate,
-  sessions,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreate: (session: Session) => void;
-  sessions: Session[];
 }) {
-  const [choiceId, setChoiceId] = useState(choices[0].id);
+  const [choiceId, setChoiceId] = useState(() => {
+    const stored = localStorage.getItem(CHOICE_KEY);
+    return choices.find((option) => option.id === stored)?.id ?? choices[0].id;
+  });
   const [directory, setDirectory] = useState<DirectoryGrant>();
   const [path, setPath] = useState("");
   const [availability, setAvailability] = useState<Record<string, Availability>>({});
@@ -86,14 +82,15 @@ export function NewSessionDialog({
   const [repo, setRepo] = useState<string | null>();
   const [folder, setFolder] = useState<"checking" | "missing" | "directory" | "other">("checking");
   const [worktree, setWorktree] = useState("");
-  const [worktreeOn, setWorktreeOn] = useState(false);
+  const [worktreeOn, setWorktreeOn] = useState(() => localStorage.getItem(WORKTREE_KEY) === "true");
   const [branch, setBranch] = useState("");
+  const [title, setTitle] = useState<string | undefined>(() =>
+    localStorage.getItem(NAME_KEY) === "true" ? "" : undefined,
+  );
   const choice = choices.find((option) => option.id === choiceId) ?? choices[0];
   const status = availability[choice.id];
   // An agent that is not installed cannot take a session yet, so the dialog offers to install it instead.
   const missing = status && !status.available ? status : undefined;
-  // Sessions already working in this repository, which is the case a worktree exists for.
-  const sharing = repo ? sessions.filter((session) => sharesRepo(session, repo)).length : 0;
   // Dialog checks are independent, so one slow registry request never holds up another harness.
   useEffect(() => {
     if (!isOpen) return;
@@ -121,7 +118,6 @@ export function NewSessionDialog({
       setRepo(null);
       setFolder("checking");
       setWorktree("");
-      setWorktreeOn(false);
       return;
     }
     setRepo(undefined);
@@ -134,7 +130,6 @@ export function NewSessionDialog({
           const root = repository?.root ?? null;
           setRepo(root);
           setWorktree(repository?.worktree ?? "");
-          setWorktreeOn(false);
           setBranch(repository?.branch ?? "");
         })
         .catch(() => {
@@ -226,6 +221,8 @@ export function NewSessionDialog({
       void invoke("revoke_directory", { rootId: directory.id });
       setDirectory(undefined);
     }
+    // A cancelled dialog stays mounted, so a name typed into it must not wait for the next session.
+    if (!open) setTitle((current) => (current === undefined ? undefined : ""));
     onOpenChange(open);
   }
 
@@ -258,19 +255,21 @@ export function NewSessionDialog({
           return;
         }
       }
-      const project = defaultSessionName(folder.path);
+      const name = title?.trim() ?? "";
       onCreate({
         id: crypto.randomUUID(),
         agent: choice.agent,
         provider: choice.provider,
         cwd: folder.path,
         rootId: folder.id,
-        name: project,
+        name: name || defaultSessionName(folder.path),
         running: false,
+        renamed: Boolean(name),
         worktree,
         repo: root || undefined,
       });
       setDirectory(undefined);
+      setTitle((current) => (current === undefined ? undefined : ""));
       onOpenChange(false);
     } finally {
       setCreating(false);
@@ -397,24 +396,56 @@ export function NewSessionDialog({
                 </p>
               ) : null}
             </div>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Label htmlFor="custom-session-name" className={SECTION}>
+                  Name{" "}
+                  <span className="text-[10px] font-normal tracking-normal text-muted-foreground/70 normal-case">
+                    Optional
+                  </span>
+                </Label>
+                <Switch
+                  id="custom-session-name"
+                  checked={title !== undefined}
+                  onCheckedChange={(checked) => {
+                    localStorage.setItem(NAME_KEY, String(checked));
+                    setTitle(checked ? "" : undefined);
+                  }}
+                />
+              </div>
+              {title !== undefined ? (
+                <Input
+                  id="session-title"
+                  value={title}
+                  placeholder="Name this session…"
+                  name="session-title"
+                  autoComplete="off"
+                  aria-label="Session name"
+                  onChange={(event) => setTitle(event.target.value)}
+                />
+              ) : null}
+            </div>
             {repo ? (
               <div className="space-y-2">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <Label htmlFor="new-worktree" className={SECTION}>
-                      Worktree
-                    </Label>
-                    <p className="text-xs text-muted-foreground">
-                      {sharing
-                        ? `${sharing} session${sharing === 1 ? "" : "s"} already work${sharing === 1 ? "s" : ""} in this project`
-                        : "Isolate this session from the main checkout"}
-                    </p>
-                  </div>
-                  <Switch id="new-worktree" checked={worktreeOn} onCheckedChange={setWorktreeOn} />
+                <div className="flex items-center gap-2">
+                  <Label htmlFor="new-worktree" className={SECTION}>
+                    Worktree{" "}
+                    <span className="text-[10px] font-normal tracking-normal text-muted-foreground/70 normal-case">
+                      Optional
+                    </span>
+                  </Label>
+                  <Switch
+                    id="new-worktree"
+                    checked={worktreeOn}
+                    onCheckedChange={(checked) => {
+                      localStorage.setItem(WORKTREE_KEY, String(checked));
+                      setWorktreeOn(checked);
+                    }}
+                  />
                 </div>
                 {worktreeOn ? (
                   <div className="min-w-0 space-y-1.5">
-                    <Label htmlFor="worktree-branch">Branch</Label>
+                    <Label htmlFor="worktree-branch">New branch</Label>
                     <Input
                       id="worktree-branch"
                       value={branch}
@@ -462,7 +493,13 @@ export function NewSessionDialog({
                         aria-pressed={active}
                         disabled={Boolean(installing)}
                         title={"note" in option ? option.note : sessionLabel(option)}
-                        onClick={() => (active && ready ? start() : setChoiceId(option.id))}
+                        onClick={() => {
+                          if (active && ready) start();
+                          else {
+                            localStorage.setItem(CHOICE_KEY, option.id);
+                            setChoiceId(option.id);
+                          }
+                        }}
                       >
                         <ProviderIcon agent={option.agent} provider={option.provider} className="size-5" />
                         <div
