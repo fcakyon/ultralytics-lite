@@ -6,6 +6,7 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
+  FolderCog,
   Info,
   KeyRound,
   Moon,
@@ -63,6 +64,7 @@ export function SettingsDialog({
   built,
   repo,
   onCheckForUpdates,
+  onFileBrowserChange,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -78,8 +80,10 @@ export function SettingsDialog({
   built: string;
   repo: string;
   onCheckForUpdates: () => void;
+  onFileBrowserChange: () => void;
 }) {
   const [auth, setAuth] = useState<ProviderAuth[]>();
+  const [hideHidden, setHideHidden] = useState<boolean>();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editing, setEditing] = useState<Set<string>>(new Set());
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
@@ -97,9 +101,11 @@ export function SettingsDialog({
     setDrafts({});
     setEditing(new Set());
     setRevealed(new Set());
-    void Promise.all([read(), invoke<boolean>("notifications_supported").then(setNotificationsSupported)]).catch(
-      (reason) => setError(String(reason)),
-    );
+    void Promise.all([
+      read(),
+      invoke<boolean>("notifications_supported").then(setNotificationsSupported),
+      invoke<boolean>("hide_hidden_files").then(setHideHidden),
+    ]).catch((reason) => setError(String(reason)));
   }, [isOpen, read]);
 
   function edit(id: string, open: boolean) {
@@ -156,6 +162,20 @@ export function SettingsDialog({
     }
   }
 
+  async function changeHideHidden(hide: boolean) {
+    setError("");
+    setBusy("hidden-files");
+    try {
+      await invoke("set_hide_hidden_files", { hide });
+      setHideHidden(hide);
+      onFileBrowserChange();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <Dialog open={isOpen} onOpenChange={onOpenChange}>
       <DialogContent className="sm:h-[36rem] sm:max-w-3xl">
@@ -173,6 +193,10 @@ export function SettingsDialog({
               <TabsTrigger value="keys">
                 <KeyRound />
                 API Keys
+              </TabsTrigger>
+              <TabsTrigger value="files">
+                <FolderCog />
+                Files
               </TabsTrigger>
               <TabsTrigger value="about">
                 <Info />
@@ -325,6 +349,29 @@ export function SettingsDialog({
                     </Item>
                   );
                 })}
+              </ItemGroup>
+            </TabsContent>
+            <TabsContent value="files" className="min-w-0">
+              <h2 className="text-base font-semibold">Files</h2>
+              <p className="mt-1 mb-4 text-sm text-muted-foreground">Choose which files appear in the browser.</p>
+              <ItemGroup>
+                <Item variant="outline">
+                  <ItemMedia variant="icon">
+                    <EyeOff />
+                  </ItemMedia>
+                  <ItemContent>
+                    <ItemTitle>Hide Hidden Files</ItemTitle>
+                    <ItemDescription>Hide files and folders whose names begin with a period.</ItemDescription>
+                  </ItemContent>
+                  <ItemActions>
+                    <Switch
+                      aria-label="Hide hidden files"
+                      checked={hideHidden ?? false}
+                      disabled={hideHidden === undefined || busy === "hidden-files"}
+                      onCheckedChange={(hide) => void changeHideHidden(hide)}
+                    />
+                  </ItemActions>
+                </Item>
               </ItemGroup>
             </TabsContent>
             <TabsContent value="about" className="min-w-0">

@@ -1464,6 +1464,7 @@ function App() {
   const [attention, setAttention] = useState<string[]>([]);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [fileBrowserVersion, setFileBrowserVersion] = useState(0);
   const [notifications, setNotifications] = useState(() => localStorage.getItem(NOTIFICATIONS_KEY) !== "false");
   const [keepAwake, setKeepAwake] = useState(() => localStorage.getItem(KEEP_AWAKE_KEY) === "true");
   const [closeWarningCount, setCloseWarningCount] = useState(0);
@@ -3310,6 +3311,7 @@ function App() {
                         session={selected}
                         remote={remote}
                         fontSize={inspectorFontSize}
+                        fileBrowserVersion={fileBrowserVersion}
                         collapsed={shut.inspector}
                         onExpand={() =>
                           glide(inspectorPanel.current, share(inspectorPanel.current, SIDES.inspector.size))
@@ -3673,6 +3675,7 @@ function App() {
             built={built}
             repo={repo}
             onCheckForUpdates={() => void checkForUpdates()}
+            onFileBrowserChange={() => setFileBrowserVersion((version) => version + 1)}
           />
           <Toaster />
         </div>
